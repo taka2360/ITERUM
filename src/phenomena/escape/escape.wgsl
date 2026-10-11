@@ -13,6 +13,17 @@
 // orbit ends, the pixel rebases (δ ← z, m ← 0), so one reference serves the
 // whole image without glitches. BLA tables skip runs of steps while |δ| < R.
 //
+// Iteration limit: kept on the GPU (Counters.max_iter) and raised there by
+// decide_limit, so the GPU never waits for the CPU to read the counters back
+// before it continues. Each invocation reads it once at its start. The rule is
+// the CPU's former one: on sample 0, once no pixel is running, double the
+// limit if a noticeable share of escapes came late (in the upper half of the
+// range), or if nothing escaped yet (up to 2^17); never beyond the cap, and
+// never when no pixel stopped at the limit. The job aggregates it uses count
+// each event once: escaped/late/interior/cycling when a pixel reaches that
+// status; raising the limit resets late and returns interior to the pixels
+// that cannot resume (cycling).
+//
 // Status: 0 running, 1 escaped, 2 stopped at the iteration limit (not proven
 // interior; it resumes when the limit is raised, so its full state is kept),
 // 3 numeric anomaly, 4 cycling (see below), 5 waiting at the end of a
@@ -51,7 +62,7 @@ struct Params {
   julia_c: vec2<f32>,
   spacing_m: f32,        // complex units per pixel, floatexp
   spacing_e: i32,
-  max_iter: u32,
+  max_iter_cap: u32,     // the limit is never raised beyond this
   budget: u32,
   orbit_len: u32,
   bla_levels: u32,
@@ -63,6 +74,12 @@ struct Params {
   // when the extension arrives. 0: rebase at the end (complete orbits).
   orbit_wait: u32,
   _p0: u32, _p1: u32, _p2: u32,
+  // Raises of the limit the CPU has seen; until it sees a new one (and lowers
+  // its budget for the pixels that rejoin), budgets are capped by budget_safe.
+  acked_raises: u32,
+  budget_safe: u32,
+  list_mode: u32,        // decide_limit: rebuild list 1 − list_in after a raise
+  _p3: u32,
 }
 
 struct PixelState {
@@ -97,6 +114,17 @@ struct Counters {
   steps_lo: atomic<u32>,
   steps_hi: atomic<u32>,
   waiting: atomic<u32>,           // unfinished pixels that wait for a longer orbit
+  proven: atomic<u32>,            // reserved: pixels finished as proven interior
+  // Per job (the CPU clears these when a job starts; only decide_limit writes them).
+  max_iter: u32,                  // current iteration limit
+  raises: u32,                    // times decide_limit raised it in this job
+  raised_now: u32,                // decide_limit raised it in this frame
+  frame_max_iter: u32,            // the limit this frame's iteration used
+  agg_escaped: u32,
+  agg_late: u32,
+  agg_interior: u32,
+  agg_cycling: u32,
+  agg_proven: u32,
 }
 
 var<workgroup> wg_iterations: atomic<u32>;
@@ -105,6 +133,8 @@ var<workgroup> wg_keep: atomic<u32>;
 var<workgroup> wg_base: u32;
 // Iteration budget of the pixel being processed (per progressive step).
 var<private> budget: u32;
+// Iteration limit, read once per invocation (see "Iteration limit").
+var<private> max_iter: u32;
 // Iterations skipped by BLA beyond one step per span (pixel being processed).
 var<private> bla_saved: u32;
 // Loop steps executed for the pixel being processed (set by process_pixel).
@@ -114,6 +144,7 @@ var<private> loop_steps: u32;
 // args (bound only to list_args, used as the indirect buffer): dispatch
 // arguments (x, y, z, _) for list 0, then for list 1.
 struct ListCtl { count: array<atomic<u32>, 4> }
+// args[8..11]: indirect arguments of the list rebuild decide_limit requests.
 const LIST_GROUP: u32 = 64u;
 const MAX_GROUPS_X: u32 = 32768u;
 
@@ -127,7 +158,7 @@ const MAX_GROUPS_X: u32 = 32768u;
 @group(0) @binding(7) var<storage, read_write> list0: array<u32>;
 @group(0) @binding(8) var<storage, read_write> list1: array<u32>;
 @group(0) @binding(9) var<storage, read_write> ctl: ListCtl;
-@group(0) @binding(10) var<storage, read_write> args: array<u32, 8>;
+@group(0) @binding(10) var<storage, read_write> args: array<u32, 12>;
 
 #include floatexp
 
@@ -167,7 +198,7 @@ fn finish_escaped(s: ptr<function, PixelState>, idx: u32, z: vec2<f32>, log2_g: 
   atomicAdd(&counters.escaped, 1u);
   atomicMax(&counters.max_escaped_n, (*s).n);
   atomicMin(&counters.min_escaped_n, (*s).n);
-  if ((*s).n > P.max_iter / 2u) { atomicAdd(&counters.late_escapes, 1u); }
+  if ((*s).n > max_iter / 2u) { atomicAdd(&counters.late_escapes, 1u); }
 }
 
 // Stops at the iteration limit. The caller has stored the iteration state, so
@@ -232,7 +263,7 @@ fn iterate_direct(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var cyc_len = 0u;
   var cyc_pow = 1u;
   for (var k = 0u; k < budget; k++) {
-    if (n >= P.max_iter) {
+    if (n >= max_iter) {
       (*s).dr = z.x; (*s).di = z.y; (*s).gr = g.x; (*s).gi = g.y; (*s).n = n;
       pause_at_limit(s, idx);
       return;
@@ -274,7 +305,7 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var cyc_len = 0u;
   var cyc_pow = 1u;
   for (var k = 0u; k < budget; k++) {
-    if (n >= P.max_iter) {
+    if (n >= max_iter) {
       (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
       pause_at_limit(s, idx);
@@ -380,7 +411,7 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var cyc_len = 0u;
   var cyc_pow = 1u;
   for (var k = 0u; k < budget; k++) {
-    if (n >= P.max_iter) {
+    if (n >= max_iter) {
       (*s).dr = d.v.x; (*s).di = d.v.y; (*s).de = d.e;
       (*s).gr = g.v.x; (*s).gi = g.v.y; (*s).ge = g.e;
       (*s).m = m; (*s).n = n;
@@ -492,11 +523,12 @@ fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
   bla_saved = 0u;
   loop_steps = 0u;
   budget = max(16u, P.budget << (2u - step));
+  if (counters.raises != P.acked_raises) { budget = min(budget, max(16u, P.budget_safe << (2u - step))); }
   let idx = pix.y * P.size.x + pix.x;
   var s = state[idx];
   if (s.job != P.job) { s = init_state(pix); }
   // Resume pixels stopped at an earlier, lower limit.
-  if (s.status == 2u && s.n < P.max_iter) { s.status = 0u; }
+  if (s.status == 2u && s.n < max_iter) { s.status = 0u; }
   // Waiting at the end of a truncated orbit: continue once it is longer (or
   // no extension is coming).
   if (s.status == 5u) {
@@ -552,6 +584,7 @@ fn add_steps(v: u32) {
 
 @compute @workgroup_size(8, 8)
 fn iterate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  max_iter = counters.max_iter;
   if (li == 0u) { atomicStore(&wg_iterations, 0u); atomicStore(&wg_steps, 0u); }
   workgroupBarrier();
   // One global atomic per workgroup keeps the throughput counter cheap.
@@ -594,6 +627,7 @@ fn list_append(li: u32, keep: bool, entry: u32, out: u32) {
 // has to advance. Dispatched 2D like iterate_list.
 @compute @workgroup_size(64)
 fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  max_iter = counters.max_iter;
   let total = P.size.x * P.size.y;
   let idx = (wid.y * nwg.x + wid.x) * LIST_GROUP + li;
   var keep = false;
@@ -601,7 +635,7 @@ fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw
   if (idx < total) {
     let pix = vec2<u32>(idx % P.size.x, idx / P.size.x);
     let s = state[idx];
-    keep = s.job != P.job || s.status == 0u || s.status == 5u || (s.status == 2u && s.n < P.max_iter);
+    keep = s.job != P.job || s.status == 0u || s.status == 5u || (s.status == 2u && s.n < max_iter);
     entry = idx | (step_of(pix) << 30u);
   }
   list_append(li, keep, entry, P.list_in);
@@ -610,6 +644,7 @@ fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw
 // Advances the pixels of list P.list_in; those still running go to the other list.
 @compute @workgroup_size(64)
 fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  max_iter = counters.max_iter;
   let i = (wid.y * nwg.x + wid.x) * LIST_GROUP + li;
   let count = atomicLoad(&ctl.count[P.list_in]);
   if (li == 0u) { atomicStore(&wg_iterations, 0u); atomicStore(&wg_steps, 0u); }
@@ -632,15 +667,58 @@ fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) 
   list_append(li, keep, entry, 1u - P.list_in);
 }
 
+// Dispatch size (x, y) for `groups` workgroups (x ≤ MAX_GROUPS_X).
+fn groups_2d(groups: u32) -> vec2<u32> {
+  let x = min(groups, MAX_GROUPS_X);
+  var y = 0u;
+  if (x > 0u) { y = (groups + x - 1u) / x; }
+  return vec2<u32>(x, y);
+}
+
+// After this frame's iteration: adds its events to the job aggregates and
+// raises the limit when the rule says so (see "Iteration limit"). In list
+// mode a raise also empties the list for the next frame and requests its
+// rebuild from the full grid (pixels stopped at the old limit rejoin).
+@compute @workgroup_size(1)
+fn decide_limit() {
+  let cur = counters.max_iter;
+  counters.frame_max_iter = cur;
+  counters.agg_escaped += atomicLoad(&counters.escaped);
+  counters.agg_late += atomicLoad(&counters.late_escapes);
+  counters.agg_interior += atomicLoad(&counters.interior);
+  counters.agg_cycling += atomicLoad(&counters.cycling);
+  counters.agg_proven += atomicLoad(&counters.proven);
+  counters.raised_now = 0u;
+  args[8] = 0u; args[9] = 1u; args[10] = 1u;
+  if (P.sample != 0u || atomicLoad(&counters.unfinished) != 0u) { return; }
+  if (cur >= P.max_iter_cap || counters.agg_interior == counters.agg_cycling + counters.agg_proven) { return; }
+  var more: bool;
+  if (counters.agg_escaped == 0u) {
+    // Nothing escaped: interior cannot be told from slow exterior. Keep
+    // looking, but not forever.
+    more = cur < (1u << 17u);
+  } else {
+    more = counters.agg_late > 16u && counters.agg_late * 500u > counters.agg_escaped;
+  }
+  if (!more) { return; }
+  counters.max_iter = min(P.max_iter_cap, cur * 2u);
+  counters.raises += 1u;
+  counters.raised_now = 1u;
+  counters.agg_interior = counters.agg_cycling + counters.agg_proven;
+  counters.agg_late = 0u;
+  if (P.list_mode != 0u) {
+    atomicStore(&ctl.count[1u - P.list_in], 0u);
+    let g = groups_2d((P.size.x * P.size.y + LIST_GROUP - 1u) / LIST_GROUP);
+    args[8] = g.x; args[9] = g.y;
+  }
+}
+
 // Indirect dispatch arguments for list P.list_in (2D: x ≤ MAX_GROUPS_X).
 @compute @workgroup_size(1)
 fn list_args() {
   let which = P.list_in;
-  let groups = (atomicLoad(&ctl.count[which]) + LIST_GROUP - 1u) / LIST_GROUP;
-  let x = min(groups, MAX_GROUPS_X);
-  var y = 0u;
-  if (x > 0u) { y = (groups + x - 1u) / x; }
-  args[which * 4u] = x;
-  args[which * 4u + 1u] = y;
+  let g = groups_2d((atomicLoad(&ctl.count[which]) + LIST_GROUP - 1u) / LIST_GROUP);
+  args[which * 4u] = g.x;
+  args[which * 4u + 1u] = g.y;
   args[which * 4u + 2u] = 1u;
 }

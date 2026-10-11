@@ -103,10 +103,18 @@ export interface EscapeStats {
   maxIter: number;
 }
 
-const COUNTER_BYTES = 64;
+// Counters (escape.wgsl): words 0..16 count this frame's events and are
+// cleared every frame; words 17.. belong to the job (see "Iteration limit").
+const FRAME_WORDS = 17;
+const C_MAX_ITER = 17;
+const C_RAISES = 18;
+const C_RAISED_NOW = 19;
+const C_FRAME_MAX_ITER = 20;
+const C_AGG = 21; // escaped, late, interior, cycling, proven
+const COUNTER_BYTES = 26 * 4;
 // Largest per-pixel budget of a full-grid pass (list mode allows more).
 const FULL_BUDGET_MAX = 1 << 16;
-const PARAM_BYTES = 96;
+const PARAM_BYTES = 112;
 const DISPLAY_BYTES = 96;
 const STATE_BYTES = 48;
 // display.wgsl averages up to this many samples (unrolled); keep both in step.
@@ -137,6 +145,14 @@ export class EscapeEngine {
   private listParams: GPUBuffer[] = [];
   private listGroups: GPUBindGroup[] = [];
   private argsGroups: GPUBindGroup[] = [];
+  // decide_limit: one group per parameter buffer it may run with.
+  private decideLayout!: GPUBindGroupLayout;
+  private decidePipeline!: GPUComputePipeline;
+  private decideGroups = new Map<GPUBuffer, GPUBindGroup>();
+  /** Job whose limit and aggregates the GPU counters currently hold. */
+  private countersJob = -1;
+  /** Raises of the limit by the GPU seen in this job's readbacks. */
+  private raisesSeen = 0;
   private listMode = false;
   private listBuild = false;
   private listCur = 0;
@@ -258,7 +274,21 @@ export class EscapeEngine {
       compute: { module, entryPoint: "list_args" },
     });
     this.listCtl = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-    this.listArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT });
+    this.listArgs = device.createBuffer({ size: 48, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT });
+    this.decideLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+      ],
+    });
+    this.decidePipeline = device.createComputePipeline({
+      label: "escape-decide-limit",
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.decideLayout] }),
+      compute: { module, entryPoint: "decide_limit" },
+    });
+    this.decideGroups.clear();
     this.listParams = [0, 1].map(() => device.createBuffer({ size: PARAM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
     this.argsGroups = this.listParams.map((p) =>
       device.createBindGroup({
@@ -478,7 +508,7 @@ export class EscapeEngine {
         f[8] = view.center[0]; f[9] = view.center[1];
         f[10] = view.juliaC[0]; f[11] = view.juliaC[1];
         f[12] = view.spacing.m; i[13] = view.spacing.e;
-        u[14] = this.maxIter;
+        u[14] = this.maxIterCap;
         // Budget of the finest step; the shader gives coarser steps (fewer
         // pixels) 2× and 4× as much.
         u[15] = Math.max(16, Math.round(this.budget));
@@ -488,9 +518,22 @@ export class EscapeEngine {
         const o = view.orbit;
         u[20] = this.orbitExtends && o && !o.escaped && !o.periodic ? 1 : 0;
         u[19] = listIn;
+        u[24] = this.raisesSeen;
+        u[25] = Math.max(16, Math.round(Math.min(this.budget, FULL_BUDGET_MAX)));
+        u[26] = this.listMode ? 1 : 0;
         device.queue.writeBuffer(target, 0, buf);
       };
-      device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+      // Clear this frame's counters; when a job starts, also set its limit
+      // and clear its aggregates.
+      const words = this.countersJob === this.job ? FRAME_WORDS : COUNTER_BYTES / 4;
+      const cw = new Uint32Array(words);
+      cw[6] = 0xffffffff;
+      if (words > FRAME_WORDS) {
+        cw[C_MAX_ITER] = cw[C_FRAME_MAX_ITER] = this.maxIter;
+        this.countersJob = this.job;
+        this.raisesSeen = 0;
+      }
+      device.queue.writeBuffer(this.counters, 0, cw);
       if (!this.listMode) {
         for (let step = 0; step < 3; step++) writeParams(this.params[step], step, 0);
         const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
@@ -500,6 +543,9 @@ export class EscapeEngine {
           pass.setBindGroup(0, groups[step]);
           pass.dispatchWorkgroups(Math.ceil(Math.ceil(w / stride) / 8), Math.ceil(Math.ceil(h / stride) / 8));
         }
+        pass.setPipeline(this.decidePipeline);
+        pass.setBindGroup(0, this.decideGroup(this.params[2]));
+        pass.dispatchWorkgroups(1);
         pass.end();
       } else {
         // listGroups[k] reads list k and appends survivors to list 1 − k.
@@ -526,6 +572,13 @@ export class EscapeEngine {
         pass.setPipeline(this.listPipelines[view.mode]);
         pass.setBindGroup(0, this.listGroups[cur]);
         pass.dispatchWorkgroupsIndirect(this.listArgs, cur * 16);
+        // A raise of the limit refills the next list from the full grid.
+        pass.setPipeline(this.decidePipeline);
+        pass.setBindGroup(0, this.decideGroup(this.listParams[cur]));
+        pass.dispatchWorkgroups(1);
+        pass.setPipeline(this.buildPipelines[view.mode]);
+        pass.setBindGroup(0, this.listGroups[other]);
+        pass.dispatchWorkgroupsIndirect(this.listArgs, 32);
         pass.end();
         this.listCur = other;
       }
@@ -563,6 +616,23 @@ export class EscapeEngine {
     return { output: target, status: this.status };
   }
 
+  private decideGroup(params: GPUBuffer): GPUBindGroup {
+    let g = this.decideGroups.get(params);
+    if (!g) {
+      g = this.device.createBindGroup({
+        layout: this.decideLayout,
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 3, resource: { buffer: this.counters } },
+          { binding: 9, resource: { buffer: this.listCtl } },
+          { binding: 10, resource: { buffer: this.listArgs } },
+        ],
+      });
+      this.decideGroups.set(params, g);
+    }
+    return g;
+  }
+
   private adaptBudget(frame: FrameContext): void {
     if (frame.dt > 0) this.frameMsAvg += (Math.min(frame.dt * 1000, 50) - this.frameMsAvg) * 0.1;
     const ms = frame.timer.passMs.get("escape");
@@ -588,7 +658,6 @@ export class EscapeEngine {
     rb.busy = true;
     const job = this.job;
     const sample = this.sample;
-    const maxIter = this.maxIter;
     const frameNo = this.computeFrames;
     queueMicrotask(() => {
       // mapAsync must be issued after submit; the frame loop submits synchronously
@@ -599,13 +668,13 @@ export class EscapeEngine {
           const c = new Uint32Array(rb.buffer.getMappedRange().slice(0));
           rb.buffer.unmap();
           rb.busy = false;
-          this.onCounters(job, sample, maxIter, c, frameNo);
+          this.onCounters(job, sample, c, frameNo);
         })
         .catch(() => (rb.busy = false));
     });
   }
 
-  private onCounters(job: number, sample: number, maxIter: number, c: Uint32Array, frameNo: number): void {
+  private onCounters(job: number, sample: number, c: Uint32Array, frameNo: number): void {
     // Throughput counts all work, including frames of superseded jobs.
     const now = performance.now();
     const pr = this.prog;
@@ -616,8 +685,11 @@ export class EscapeEngine {
     pr.anyUnfinished = c[0];
     pr.anyCoarse = c[9];
     pr.anyMid = c[10];
-    // Frames recorded before the limit was raised belong to the old limit.
-    if (job !== this.job || sample !== this.sample || maxIter !== this.maxIter) return;
+    if (job !== this.job || sample !== this.sample) return;
+    // The GPU raised the limit (perhaps several frames ago): follow it.
+    if (c[C_RAISES] > this.raisesSeen) this.noteRaises(c);
+    // Frames recorded before the latest raise belong to an older limit.
+    if (c[C_FRAME_MAX_ITER] !== this.maxIter && !c[C_RAISED_NOW]) return;
     pr.coarse = c[9];
     pr.mid = c[10];
     const a = this.agg;
@@ -629,31 +701,25 @@ export class EscapeEngine {
       if (c[9] === 0) pr.sMinLocked = true;
     }
     a.unfinished = c[0];
-    a.escaped += c[1];
-    a.interior += c[2];
     a.anomalies += c[3];
     a.rebases += c[4];
     a.maxN = Math.max(a.maxN, c[5]);
     a.blaSteps += c[7];
-    a.late += c[8];
-    a.cycling += c[12];
+    a.late = c[C_AGG + 1];
     if (c[0] !== 0 && c[0] === c[15]) this.waitFrames.orbit++;
     // Few pixels left: from now on dispatch only those.
     if (c[0] !== 0 && !this.listMode && c[0] < this.width * this.height * this.compactBelow) {
       this.listMode = true;
       this.listBuild = true;
     }
-    if (c[0] !== 0) return;
-    // Sample complete. Frames recorded since then had nothing to do.
+    // Job totals from the GPU (exact: every frame counted).
+    a.escaped = c[C_AGG];
+    a.interior = c[C_AGG + 2];
+    a.cycling = c[C_AGG + 3];
+    // No pixel running, and the GPU kept the limit: the sample is complete.
+    if (c[0] !== 0 || c[C_RAISED_NOW]) return;
     const idle = this.computeFrames - frameNo;
     this.lastComplete = this.stats();
-    if (this.sample === 0) {
-      if (this.wantsMoreIterations()) {
-        this.waitFrames.limit += idle;
-        this.extendIterations();
-        return;
-      }
-    }
     this.waitFrames.sample += idle;
     this.samplesDone++;
     if (this.samplesDone >= this.sampleTarget) {
@@ -670,37 +736,18 @@ export class EscapeEngine {
   }
 
   /**
-   * Doubles the iteration limit; pixels stopped at the old limit continue from
-   * where they are and finished pixels keep their results.
+   * The GPU doubled the iteration limit (escape.wgsl, "Iteration limit"):
+   * pixels stopped at the old limit continue from where they are, finished
+   * pixels keep their results. Many pixels may rejoin at once, so the budget
+   * returns to a full-grid one (the GPU caps it until this is seen).
    */
-  private extendIterations(): void {
-    this.maxIter = Math.min(this.maxIterCap, this.maxIter * 2);
-    this.restarts++;
+  private noteRaises(c: Uint32Array): void {
+    this.restarts += c[C_RAISES] - this.raisesSeen;
+    this.raisesSeen = c[C_RAISES];
+    this.maxIter = c[C_MAX_ITER];
     this.prog.note = `反復上限を ${this.maxIter.toLocaleString()} に引き上げて計算を継続中`;
-    // Escapes so far are below the old limit, so not "late" for the new one;
-    // pixels at the old limit are counted again when they stop or escape.
-    // Cycling pixels stay interior (they would stop at every limit).
-    this.agg.interior = this.agg.cycling;
-    // Pixels at the old limit are not in the list: rebuild it. Many may
-    // rejoin at once, so start again from a full-grid budget.
-    if (this.listMode) this.listBuild = true;
     this.budget = Math.min(this.budget, FULL_BUDGET_MAX);
-    this.agg.late = 0;
     this.agg.unfinished = -1;
-  }
-
-  /**
-   * Pixels still iterating at the limit are drawn as interior. If a noticeable
-   * share of escapes happened in the upper half of the range, more of those
-   * "interior" pixels are probably exterior too, so the limit doubles.
-   */
-  private wantsMoreIterations(): boolean {
-    const a = this.agg;
-    if (this.maxIter >= this.maxIterCap || a.interior === 0) return false;
-    // Nothing escaped: we cannot tell interior from slow exterior. Keep looking,
-    // but not forever: a view entirely inside the set stops at 2^17.
-    if (a.escaped === 0) return this.maxIter < 1 << 17;
-    return a.late > Math.max(16, a.escaped * 0.002);
   }
 
   progress(): EscapeProgress {
