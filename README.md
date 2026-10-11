@@ -38,6 +38,8 @@ npm run shots        # 確認用スクリーンショット（artifacts/*.png）
 npm run golden -- artifacts/golden-a   # 固定視点の計算結果と所要時間を保存（速度改善の前後比較用）
 node scripts/golden-diff.mjs artifacts/golden-a artifacts/golden-b   # 2 回分をビット単位で比較
 cargo run --release --manifest-path src-tauri/Cargo.toml --example orbit_bench   # 基準軌道の計算速度
+ITERUM_ONLY=boundary-p2 ITERUM_CAP=4194304 ITERUM_TIMING=0 npm run golden -- artifacts/x   # 視点・上限を絞った実験（ITERUM_PROVEN / ITERUM_PATCHES / ITERUM_TRAP / ITERUM_SHARE も）
+ITERUM_DUMP_LIMIT=65536 npm run golden -- artifacts/cudadump   # CUDA 比較用の書き出し（src-tauri/examples/cuda/README.md）
 npm run voyages      # Voyage の目的地を再生成
 ```
 
@@ -72,4 +74,6 @@ src-tauri/src/deepzoom/   任意精度の基準軌道、BLA、バイナリ形式
 - |Z+δ| < |δ| または軌道の終端で δ を全体値に置き換える rebasing により、1 本の基準軌道で画像全体を破綻なく描く。
 - 画素幅や軌道の最小値が f32 の指数範囲を外れると、δ・軌道・BLA 係数をすべて floatexp（f32 仮数＋i32 指数）で扱うモードに切り替える。
 - BLA（双線形近似）で多数の反復をまとめて飛ばす。
+- 主カージオイド・周期 2 円板の内部は閉じた式で、その他の双曲成分の内部は CPU 上の Taylor モデルと Krawczyk 法で、誤差上限つきで証明し、証明できた画素は反復上限まで回さない（`src/phenomena/escape/PROOF.md`）。
+- 基準軌道の延長は前回の続きから計算し、増えた部分だけを送る。反復上限の引き上げは GPU 内で判定する。
 - 基準軌道の計算中は直前の画像を再投影して表示し、誤った画像を完成扱いにしない。
