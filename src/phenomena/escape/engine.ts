@@ -101,7 +101,7 @@ export interface EscapeStats {
   maxIter: number;
 }
 
-const COUNTER_BYTES = 48;
+const COUNTER_BYTES = 52;
 const PARAM_BYTES = 96;
 const DISPLAY_BYTES = 96;
 const STATE_BYTES = 48;
@@ -164,7 +164,7 @@ export class EscapeEngine {
   /** density: palette cycles per doubling of (iterations − sMin)/bandScale. */
   look = { offset: 0, density: 0.32, glow: 0.6, sMin: 0, bandScale: 6, interiorGlow: 0.3 };
 
-  private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1 };
+  private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0 };
   /** Aggregated statistics of the most recently completed sample. */
   lastComplete?: EscapeStats;
   /** Iterations advanced since init (BLA spans counted in full); benchmarks. */
@@ -287,7 +287,7 @@ export class EscapeEngine {
   }
 
   private resetAgg(): void {
-    this.agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1 };
+    this.agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0 };
   }
 
   /**
@@ -403,12 +403,11 @@ export class EscapeEngine {
         u[16] = view.orbit?.len ?? 0;
         u[17] = view.orbit?.levels ?? 0;
         u[18] = this.sample;
-        u[19] = this.maxIterCap;
         const o = view.orbit;
         u[20] = this.orbitExtends && o && !o.escaped && !o.periodic ? 1 : 0;
         device.queue.writeBuffer(this.params[step], 0, buf);
       }
-      device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0]));
+      device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0, 0]));
       const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
       pass.setPipeline(this.pipelines[view.mode]);
       for (let step = 0; step < 3; step++) {
@@ -512,6 +511,7 @@ export class EscapeEngine {
     a.maxN = Math.max(a.maxN, c[5]);
     a.blaSteps += c[7];
     a.late += c[8];
+    a.cycling += c[12];
     if (c[0] !== 0) return;
     // Sample complete.
     this.lastComplete = this.stats();
@@ -544,7 +544,8 @@ export class EscapeEngine {
     this.prog.note = `反復上限を ${this.maxIter.toLocaleString()} に引き上げて計算を継続中`;
     // Escapes so far are below the old limit, so not "late" for the new one;
     // pixels at the old limit are counted again when they stop or escape.
-    this.agg.interior = 0;
+    // Cycling pixels stay interior (they would stop at every limit).
+    this.agg.interior = this.agg.cycling;
     this.agg.late = 0;
     this.agg.unfinished = -1;
   }

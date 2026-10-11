@@ -239,7 +239,8 @@ export async function runBench(app: App): Promise<void> {
   };
   const lines: string[] = [];
   const only = await envVar("ITERUM_BENCH");
-  const list = only === "deep" ? [] : only === "static" ? SCENARIOS.filter((s) => s.converge) : SCENARIOS;
+  // ITERUM_BENCH: "deep" (analysis only), "static" (converging scenes) or a scenario name.
+  const list = only === "deep" ? [] : only === "static" ? SCENARIOS.filter((s) => s.converge) : only ? SCENARIOS.filter((s) => s.name === only) : SCENARIOS;
   for (const sc of list) {
     const runs: RunStats[] = [];
     for (let r = 0; r < RUNS; r++) runs.push(await runOnce(app, sc));
