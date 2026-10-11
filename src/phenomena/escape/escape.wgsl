@@ -13,6 +13,12 @@
 // orbit ends, the pixel rebases (δ ← z, m ← 0), so one reference serves the
 // whole image without glitches. BLA tables skip runs of steps while |δ| < R.
 //
+// Status: 0 running, 1 escaped, 2 stopped at the iteration limit (not proven
+// interior; it resumes when the limit is raised, so its full state is kept),
+// 3 numeric anomaly, 4 proven interior (reserved). BLA spans may run past the
+// current limit (up to iter_cap), so the path a pixel takes never depends on
+// the limit: raising it and resuming equals starting with the higher limit.
+//
 // Progressive order: STEP 0 handles every 4th pixel in x and y, STEP 1 the
 // remaining even pixels, STEP 2 the rest; the display pass fills gaps from
 // coarser pixels.
@@ -36,7 +42,7 @@ struct Params {
   orbit_len: u32,
   bla_levels: u32,
   sample: u32,
-  _pad: u32,
+  iter_cap: u32,         // hard iteration cap; BLA spans never depend on max_iter
 }
 
 struct PixelState {
@@ -45,7 +51,7 @@ struct PixelState {
   gr: f32, gi: f32, ge: i32,   // derivative dz/dc · spacing (pixel units)
   n: u32,                      // iterations so far
   job: u32,
-  status: u32,                 // 0 running, 1 escaped, 2 interior (max_iter), 3 numeric anomaly
+  status: u32,                 // see "Status" above
   rebases: u32,
   trap: f32,                   // smallest |z|² seen (interior shading)
 }
@@ -119,12 +125,11 @@ fn finish_escaped(s: ptr<function, PixelState>, idx: u32, z: vec2<f32>, log2_g: 
   if ((*s).n > P.max_iter / 2u) { atomicAdd(&counters.late_escapes, 1u); }
 }
 
-fn finish_interior(s: ptr<function, PixelState>, idx: u32) {
-  (*s).dr = -1.0;
-  (*s).di = 0.0;
+// Stops at the iteration limit. The caller has stored the iteration state, so
+// the pixel can resume if the limit is raised; meanwhile it shows as interior.
+fn pause_at_limit(s: ptr<function, PixelState>, idx: u32) {
   (*s).status = 2u;
   samples[P.sample * P.size.x * P.size.y + idx] = vec2<f32>(-1.0, sqrt((*s).trap));
-  (*s).di = sqrt((*s).trap);
   atomicAdd(&counters.interior, 1u);
 }
 
@@ -167,7 +172,11 @@ fn iterate_direct(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var gc = 0.0;
   if (MODE == 0u) { c = P.center + rel_pos(pix) * sp; gc = sp; }
   for (var k = 0u; k < P.budget; k++) {
-    if (n >= P.max_iter) { (*s).n = n; finish_interior(s, idx); return; }
+    if (n >= P.max_iter) {
+      (*s).dr = z.x; (*s).di = z.y; (*s).gr = g.x; (*s).gi = g.y; (*s).n = n;
+      pause_at_limit(s, idx);
+      return;
+    }
     g = 2.0 * cmul(z, g) + vec2<f32>(gc, 0.0);
     z = cmul(z, z) + c;
     n++;
@@ -198,7 +207,14 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   let dc = (rel_pos(pix) + P.cmr) * sp;
   let last = P.orbit_len - 1u;
   for (var k = 0u; k < P.budget; k++) {
-    if (n >= P.max_iter) { (*s).n = n; finish_interior(s, idx); atomicAdd(&counters.rebases, rebases); return; }
+    if (n >= P.max_iter) {
+      (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
+      (*s).rebases += rebases;
+      pause_at_limit(s, idx);
+      atomicAdd(&counters.rebases, rebases);
+      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      return;
+    }
     var stepped = false;
     if (m > 0u && P.bla_levels > 0u) {
       let mm = m - 1u;
@@ -208,7 +224,7 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
         if (l == 0u) { break; }
         let span = 1u << l;
         let i = bla_off[l - 1u] + (mm >> l);
-        if (n + span <= P.max_iter && i < bla_off[l]) {
+        if (n + span <= P.iter_cap && i < bla_off[l]) {
           let e = bla[i];
           if (e.ae < 100 && e.be < 100 && e.r2e > -120 && d2 < ldexp(e.r2m, e.r2e)) {
             let a = ldexp(vec2<f32>(e.ar, e.ai), vec2<i32>(e.ae));
@@ -273,7 +289,16 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   let dc = cf_scale(cf_make(rel_pos(pix) + P.cmr, 0), sp);
   let last = P.orbit_len - 1u;
   for (var k = 0u; k < P.budget; k++) {
-    if (n >= P.max_iter) { (*s).n = n; finish_interior(s, idx); atomicAdd(&counters.rebases, rebases); return; }
+    if (n >= P.max_iter) {
+      (*s).dr = d.v.x; (*s).di = d.v.y; (*s).de = d.e;
+      (*s).gr = g.v.x; (*s).gi = g.v.y; (*s).ge = g.e;
+      (*s).m = m; (*s).n = n;
+      (*s).rebases += rebases;
+      pause_at_limit(s, idx);
+      atomicAdd(&counters.rebases, rebases);
+      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      return;
+    }
     var stepped = false;
     if (m > 0u && P.bla_levels > 0u) {
       let mm = m - 1u;
@@ -283,7 +308,7 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
         if (l == 0u) { break; }
         let span = 1u << l;
         let i = bla_off[l - 1u] + (mm >> l);
-        if (n + span <= P.max_iter && i < bla_off[l]) {
+        if (n + span <= P.iter_cap && i < bla_off[l]) {
           let e = bla[i];
           if (fe_less_pos(d2, FE(e.r2m, e.r2e))) {
             let a = CF(vec2<f32>(e.ar, e.ai), e.ae);
@@ -349,6 +374,8 @@ fn process(gid: vec3<u32>) -> u32 {
   let idx = pix.y * P.size.x + pix.x;
   var s = state[idx];
   if (s.job != P.job) { s = init_state(pix); }
+  // Resume pixels stopped at an earlier, lower limit.
+  if (s.status == 2u && s.n < P.max_iter) { s.status = 0u; }
   if (s.status != 0u) { return 0u; }
   let n0 = s.n;
   if (MODE <= 1u) {

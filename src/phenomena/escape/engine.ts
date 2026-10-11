@@ -388,6 +388,7 @@ export class EscapeEngine {
         u[16] = view.orbit?.len ?? 0;
         u[17] = view.orbit?.levels ?? 0;
         u[18] = this.sample;
+        u[19] = this.maxIterCap;
         device.queue.writeBuffer(this.params[step], 0, buf);
       }
       device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0]));
@@ -448,6 +449,7 @@ export class EscapeEngine {
     rb.busy = true;
     const job = this.job;
     const sample = this.sample;
+    const maxIter = this.maxIter;
     queueMicrotask(() => {
       // mapAsync must be issued after submit; the frame loop submits synchronously
       // after render() returns, and microtasks run after the current task.
@@ -457,13 +459,13 @@ export class EscapeEngine {
           const c = new Uint32Array(rb.buffer.getMappedRange().slice(0));
           rb.buffer.unmap();
           rb.busy = false;
-          this.onCounters(job, sample, c);
+          this.onCounters(job, sample, maxIter, c);
         })
         .catch(() => (rb.busy = false));
     });
   }
 
-  private onCounters(job: number, sample: number, c: Uint32Array): void {
+  private onCounters(job: number, sample: number, maxIter: number, c: Uint32Array): void {
     // Throughput counts all work, including frames of superseded jobs.
     const now = performance.now();
     const pr = this.prog;
@@ -473,7 +475,8 @@ export class EscapeEngine {
     pr.anyUnfinished = c[0];
     pr.anyCoarse = c[9];
     pr.anyMid = c[10];
-    if (job !== this.job || sample !== this.sample) return;
+    // Frames recorded before the limit was raised belong to the old limit.
+    if (job !== this.job || sample !== this.sample || maxIter !== this.maxIter) return;
     pr.coarse = c[9];
     pr.mid = c[10];
     const a = this.agg;
@@ -497,10 +500,7 @@ export class EscapeEngine {
     this.lastComplete = this.stats();
     if (this.sample === 0) {
       if (this.wantsMoreIterations()) {
-        this.maxIter = Math.min(this.maxIterCap, this.maxIter * 2);
-        this.restarts++;
-        this.prog.note = `反復上限を ${this.maxIter.toLocaleString()} に引き上げて再計算中`;
-        this.restart();
+        this.extendIterations();
         return;
       }
     }
@@ -515,6 +515,21 @@ export class EscapeEngine {
     this.job++;
     this.framesSinceJob = 0;
     this.resetAgg();
+  }
+
+  /**
+   * Doubles the iteration limit; pixels stopped at the old limit continue from
+   * where they are and finished pixels keep their results.
+   */
+  private extendIterations(): void {
+    this.maxIter = Math.min(this.maxIterCap, this.maxIter * 2);
+    this.restarts++;
+    this.prog.note = `反復上限を ${this.maxIter.toLocaleString()} に引き上げて計算を継続中`;
+    // Escapes so far are below the old limit, so not "late" for the new one;
+    // pixels at the old limit are counted again when they stop or escape.
+    this.agg.interior = 0;
+    this.agg.late = 0;
+    this.agg.unfinished = -1;
   }
 
   /**

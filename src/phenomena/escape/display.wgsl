@@ -78,8 +78,10 @@ fn shade(v: vec2<f32>) -> vec3<f32> {
 
 fn current(idx: u32) -> vec2<f32> {
   let s = state[idx];
-  if (s.job == D.job && s.status != 0u) { return vec2<f32>(s.dr, s.di); }
-  return vec2<f32>(NONE, 0.0);
+  if (s.job != D.job || s.status == 0u) { return vec2<f32>(NONE, 0.0); }
+  // Stopped at the iteration limit (state kept for resuming) or proven interior.
+  if (s.status == 2u || s.status == 4u) { return vec2<f32>(-1.0, sqrt(s.trap)); }
+  return vec2<f32>(s.dr, s.di);
 }
 
 @fragment

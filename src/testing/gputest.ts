@@ -25,6 +25,7 @@ import lorenzSrc from "../phenomena/lorenz/lorenz.wgsl?raw";
 import floatexpTestSrc from "./floatexp_test.wgsl?raw";
 import { diag, envVar, exitApp } from "../platform";
 import { frames, seconds, shot } from "./harness";
+import { GOLDEN_VIEWS, renderGolden } from "./golden";
 
 interface Result {
   name: string;
@@ -319,6 +320,30 @@ async function testModesAgree(app: App, orbits: OrbitManager): Promise<void> {
   b.engine.dispose();
 }
 
+// ---- iteration limit: resuming equals starting high ----------------------------
+
+/**
+ * A view whose limit is raised during computation (pixels resume from their
+ * state) must give bit-identical samples to the same view computed with the
+ * final limit from the start.
+ */
+async function testExtendEquivalence(app: App, orbits: OrbitManager): Promise<void> {
+  for (const name of ["seahorse-1e-2", "perturb-1e-15", "floatexp-1e-98"]) {
+    const gv = GOLDEN_VIEWS.find((v) => v.name === name)!;
+    const a = await renderGolden(app, gv, orbits);
+    const sa = new Uint32Array((await a.engine.readSamples()).buffer);
+    const limit = a.engine.maxIter;
+    a.engine.dispose();
+    const b = await renderGolden(app, gv, orbits, undefined, undefined, (e) => (e.minIter = e.maxIter = limit));
+    const sb = new Uint32Array((await b.engine.readSamples()).buffer);
+    b.engine.dispose();
+    let diff = 0;
+    for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) diff++;
+    report(`extend-${name}`, diff === 0 && a.result.restarts > 0 && b.result.restarts === 0,
+      `limit raised ${a.result.restarts}x to ${limit} vs ${limit} from the start: ${diff} of ${sa.length} sample words differ`);
+  }
+}
+
 // ---- device loss ------------------------------------------------------------
 
 async function meanLuma(png: Uint8Array): Promise<number> {
@@ -467,7 +492,7 @@ async function testProgress(app: App): Promise<void> {
   const v = VOYAGES.find((t) => t.name === "Abyssal Plain")!;
   app.overlay.toggle("progress");
   m.setView(v.re, v.im, -v.depthLog2 + 4 - Math.log2(app.canvas.width));
-  const seen = { minFraction: 1, orbitRow: false, rate: 0, headlines: new Set<string>() };
+  const seen = { minFraction: 1, orbitRow: false, rate: 0, headlines: new Set<string>(), finishS: NaN };
   const t0 = performance.now();
   let done = false;
   while (performance.now() - t0 < 60000) {
@@ -479,6 +504,8 @@ async function testProgress(app: App): Promise<void> {
     const rate = p.rows.find((r) => r.label === "処理速度");
     if (rate) seen.rate = Math.max(seen.rate, parseFloat(rate.value));
     if (p.fraction === 1 && p.headline.includes("完成")) {
+      const v = p.rows.find((r) => r.label === "完成までの時間")?.value ?? "";
+      seen.finishS = parseFloat(v) / (v.endsWith("ms") ? 1000 : 1);
       done = true;
       break;
     }
@@ -487,11 +514,14 @@ async function testProgress(app: App): Promise<void> {
   const panelRows = document.querySelectorAll("#progress .row").length;
   const panelHeadline = document.querySelector("#progress .headline")?.textContent ?? "";
   app.overlay.toggle("progress");
-  const ok = done && seen.minFraction < 1 && seen.orbitRow && seen.rate > 0 && panelRows >= 8;
+  // An image finished within the first 0.4 s is reported per frame ("moving"),
+  // so the bar may legitimately never show a partial fraction.
+  const sawPartial = seen.minFraction < 1 || seen.finishS < 0.5;
+  const ok = done && sawPartial && seen.orbitRow && seen.rate > 0 && panelRows >= 8;
   report(
     "progress",
     ok,
-    `10^-1000 view: started at ${(seen.minFraction * 100).toFixed(0)}%, reached 完成 ${done}, orbit row ${seen.orbitRow}, throughput seen ${seen.rate > 0}, panel rows ${panelRows} ("${panelHeadline}"), headlines: ${[...seen.headlines].join(" / ")}`,
+    `10^-1000 view: started at ${(seen.minFraction * 100).toFixed(0)}%, reached 完成 ${done} after ${seen.finishS} s, orbit row ${seen.orbitRow}, throughput seen ${seen.rate > 0}, panel rows ${panelRows} ("${panelHeadline}"), headlines: ${[...seen.headlines].join(" / ")}`,
   );
 }
 
@@ -509,6 +539,7 @@ export async function runGpuTests(app: App): Promise<void> {
   steps.push(["deep-1e-98-wide", () => deepView(app, v("Elephant Valley").re, v("Elephant Valley").im, -v("Elephant Valley").depthLog2 + 6, "auto", 50000, "escape-floatexp-1e-98-surroundings", orbits)]);
   steps.push(["deep-1e-300", () => deepView(app, v("Seahorse Abyss").re, v("Seahorse Abyss").im, -v("Seahorse Abyss").depthLog2 + 2, "auto", 50000, "escape-floatexp-1e-300", orbits)]);
   steps.push(["modes", () => testModesAgree(app, orbits)]);
+  steps.push(["extend", () => testExtendEquivalence(app, orbits)]);
   steps.push(["controls", () => testControls(app)]);
   steps.push(["progress", () => testProgress(app)]);
   steps.push(["colour", () => testColourStability(app)]);
