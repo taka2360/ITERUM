@@ -10,6 +10,7 @@ import { createPhenomena } from "./core/registry";
 import type { Phenomenon } from "./core/phenomenon";
 import { Overlay } from "./ui/overlay";
 import { diag, launchMode, toggleFullscreen } from "./platform";
+import { formatZoom, locationText, log2ScaleFromZoom, log2ZoomFromScale, normalizeDecimal, parseZoom, type Location } from "./ui/location";
 
 const TRANSITION_S = 1.6;
 const QUALITY_ORDER: QualityMode[] = ["auto", "low", "medium", "high"];
@@ -52,6 +53,8 @@ export class App {
     this.overlay.onSelect = (i) => this.select(i);
     this.overlay.onPlay = () => this.togglePlay();
     this.overlay.onReset = () => this.resetView();
+    this.overlay.onLocationGo = (re, im, zoom) => this.goTo(re, im, zoom);
+    this.overlay.onLocationCopy = () => this.copyLocation();
     window.addEventListener("keydown", (e) => this.onKey(e));
     new ResizeObserver(() => this.resize()).observe(canvas);
     this.resize();
@@ -61,6 +64,7 @@ export class App {
     if (!(await this.initGpu())) return false;
     this.overlay.show(this.phenomena[0].meta, 0);
     this.phenomena[0].setActive?.(true);
+    this.overlay.setLocationAvailable(!!this.active.view);
     this.syncControls();
     requestAnimationFrame((t) => this.frame(t));
     return true;
@@ -139,6 +143,49 @@ export class App {
     this.syncControls();
   }
 
+  /** Centre and zoom of the active view, if it is a complex-plane view. */
+  location(): Location | undefined {
+    const v = this.active.view?.();
+    if (!v) return undefined;
+    return { re: v.re, im: v.im, log2Zoom: log2ZoomFromScale(v.log2Scale, this.canvas.width, this.canvas.height) };
+  }
+
+  /** Jumps to a typed location; returns the fields that could not be read. */
+  goTo(reText: string, imText: string, zoomText: string): ("re" | "im" | "zoom")[] {
+    const p = this.active;
+    if (!p.setView) return [];
+    const bad: ("re" | "im" | "zoom")[] = [];
+    const read = <T>(k: "re" | "im" | "zoom", f: () => T): T | undefined => {
+      try {
+        return f();
+      } catch {
+        bad.push(k);
+        return undefined;
+      }
+    };
+    const re = read("re", () => normalizeDecimal(reText));
+    const im = read("im", () => normalizeDecimal(imText));
+    const log2Zoom = read("zoom", () => parseZoom(zoomText));
+    if (bad.length) {
+      this.overlay.toast("読み取れない値があります");
+      return bad;
+    }
+    if (this.lastOutput) this.outgoing = { texture: this.lastOutput };
+    this.transition = 0;
+    this.transitionS = 0.9;
+    p.setView(re!, im!, log2ScaleFromZoom(log2Zoom!, this.canvas.width, this.canvas.height));
+    this.syncControls();
+    this.overlay.toast(`移動しました — 拡大率 ${formatZoom(log2Zoom!)}`);
+    return [];
+  }
+
+  private async copyLocation(): Promise<void> {
+    const loc = this.location();
+    if (!loc) return;
+    const ok = await this.overlay.copyText(locationText(loc));
+    this.overlay.toast(ok ? "座標と拡大率をコピーしました" : "コピーできませんでした");
+  }
+
   private syncControls(): void {
     const p = this.active;
     const playing = p.meta.motion === "voyage" ? !!p.playing?.() : !this.paused;
@@ -170,10 +217,13 @@ export class App {
     this.transition = 0;
     this.transitionS = TRANSITION_S;
     this.overlay.show(this.active.meta, i);
+    this.overlay.setLocationAvailable(!!this.active.view);
     this.syncControls();
   }
 
   private onKey(e: KeyboardEvent): void {
+    // Typing in a text field (location panel) is not a shortcut.
+    if (e.target instanceof HTMLInputElement) return;
     if (e.repeat && !["ArrowLeft", "ArrowRight"].includes(e.key)) return;
     this.overlay.wake();
     if (this.active.onKey?.(e.key)) return;
@@ -190,6 +240,12 @@ export class App {
       case "?": case "/": this.overlay.toggle("help"); break;
       case "d": case "D": this.overlay.toggle("debug"); break;
       case "p": case "P": this.overlay.toggle("progress"); this.lastProgressUpdate = 0; break;
+      case "l": case "L":
+        if (this.active.view) {
+          this.overlay.toggle("location");
+          this.lastLocationUpdate = 0;
+        }
+        break;
       case "q": case "Q": {
         const next = QUALITY_ORDER[(QUALITY_ORDER.indexOf(this.governor.mode) + 1) % QUALITY_ORDER.length];
         this.governor.setMode(next);
@@ -258,6 +314,7 @@ export class App {
     this.syncControls();
     if (this.overlay.isOpen("debug")) this.updateDebug(rafMs, cpuMs, width, height);
     this.updateProgress(now, rafMs, width, height);
+    this.updateLocation(now);
     this.onFrame?.({ now, rafMs, cpuMs });
   }
 
@@ -295,6 +352,15 @@ export class App {
         done(new Uint8Array(await blob.arrayBuffer()));
       });
     };
+  }
+
+  private lastLocationUpdate = 0;
+
+  private updateLocation(now: number): void {
+    if (!this.overlay.isOpen("location") || now - this.lastLocationUpdate < 120) return;
+    this.lastLocationUpdate = now;
+    const loc = this.location();
+    if (loc) this.overlay.setLocation(loc.re, loc.im, formatZoom(loc.log2Zoom));
   }
 
   private lastProgressUpdate = 0;

@@ -76,6 +76,10 @@ export interface Phenomenon {
   notice?(): string | undefined;
   /** Returns the view (camera) to its starting point; the simulation keeps running. */
   reset(): void;
+  /** For complex-plane views: centre as decimal strings and log2 of complex units per device pixel. */
+  view?(): { re: string; im: string; log2Scale: number };
+  /** Jumps to a view given in the form view() returns (decimals already normalised). */
+  setView?(re: string, im: string, log2Scale: number): void;
   /** For motion "voyage": whether the journey is running, and control of it. */
   playing?(): boolean;
   setPlaying?(on: boolean): void;

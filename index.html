@@ -23,10 +23,24 @@
  <button id="progress-toggle" type="button" title="計算の進み具合（P）" aria-label="計算の進み具合">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18V12" /><path d="M10 18V7" /><path d="M15 18v-8" /><path d="M20 18V5" /></svg>
         </button>
+        <button id="location-toggle" type="button" title="現在地 — 座標と拡大率（L）" aria-label="現在地">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6" /><path d="M12 3v4M12 17v4M3 12h4M17 12h4" /></svg>
+        </button>
         <button id="reset" type="button" title="視点を戻す（R）" aria-label="視点を戻す">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 12a6.5 6.5 0 1 0 2.1-4.8" /><path d="M5 4.5v3.6h3.6" /></svg>
         </button>
       </nav>
+      <section id="location" hidden>
+        <h2>現在地</h2>
+        <label><span>実部</span><input id="loc-re" type="text" spellcheck="false" autocomplete="off" /></label>
+        <label><span>虚部</span><input id="loc-im" type="text" spellcheck="false" autocomplete="off" /></label>
+        <label><span>拡大率</span><input id="loc-zoom" type="text" spellcheck="false" autocomplete="off" /></label>
+        <div class="actions">
+          <span class="hint">貼り付け・入力して Enter で移動</span>
+          <button id="loc-copy" type="button">コピー</button>
+          <button id="loc-go" type="button">移動</button>
+        </div>
+      </section>
       <aside id="notice"></aside>
       <aside id="toast"></aside>
       <section id="help" hidden>

@@ -252,3 +252,53 @@ body.hidden-ui #ui > * { opacity: 0 !important; }
 #unsupported p { font-family: var(--sans); font-size: 12px; letter-spacing: 0.1em; color: var(--ink-faint); max-width: 420px; text-align: center; line-height: 2; }
 
 [hidden] { display: none !important; }
+
+#location {
+  position: absolute;
+  top: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(560px, calc(100vw - 32px));
+  box-sizing: border-box;
+  padding: 18px 22px 16px;
+  background: rgba(6, 7, 11, 0.72);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(236, 231, 220, 0.08);
+  font-family: var(--sans);
+  pointer-events: auto;
+}
+#location h2 { margin: 0 0 12px; font-family: var(--serif); font-weight: normal; font-size: 13px; letter-spacing: 0.4em; color: var(--ink-soft); }
+#location label { display: grid; grid-template-columns: 4.5em 1fr; align-items: center; gap: 10px; margin-top: 6px; }
+#location label span { font-size: 10px; letter-spacing: 0.16em; color: var(--ink-faint); }
+#location input {
+  all: unset;
+  min-width: 0;
+  padding: 5px 8px;
+  font: 12px/1.4 "Cascadia Mono", Consolas, monospace;
+  color: var(--ink);
+  background: rgba(236, 231, 220, 0.04);
+  border-bottom: 1px solid rgba(236, 231, 220, 0.12);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+#location input:focus { border-bottom-color: var(--ink-soft); background: rgba(236, 231, 220, 0.07); }
+#location input.invalid { border-bottom-color: rgba(230, 120, 110, 0.8); }
+#location .actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+#location .hint { flex: 1; font-size: 10px; letter-spacing: 0.1em; color: var(--ink-faint); }
+#location button {
+  all: unset;
+  cursor: pointer;
+  padding: 5px 14px;
+  border-radius: 13px;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  color: var(--ink-soft);
+  border: 1px solid rgba(236, 231, 220, 0.14);
+  transition: color 0.4s, background-color 0.4s;
+}
+#location button:hover { color: var(--ink); background: rgba(236, 231, 220, 0.07); }
+#location button:focus-visible { outline: 1px solid var(--ink-faint); }

@@ -2,6 +2,7 @@
 // whose roots drift slowly, so the boundaries between basins keep weaving.
 
 import { Camera2D } from "../../core/camera2d";
+import { numberToDecimal } from "../../ui/location";
 import type { InputFrame } from "../../core/input";
 import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo } from "../../core/phenomenon";
 import { int } from "../../ui/format";
@@ -74,6 +75,18 @@ export class Newton implements Phenomenon {
 
   reset(): void {
     this.needsHome = true;
+    this.velocity = [0, 0];
+    this.zoomImpulse = 0;
+  }
+
+  view(): { re: string; im: string; log2Scale: number } {
+    const cam = this.camera;
+    return { re: numberToDecimal(cam.cx, cam.log2Scale), im: numberToDecimal(cam.cy, cam.log2Scale), log2Scale: cam.log2Scale };
+  }
+
+  setView(re: string, im: string, log2Scale: number): void {
+    this.camera = new Camera2D(Number(re), Number(im), log2Scale);
+    this.needsHome = false;
     this.velocity = [0, 0];
     this.zoomImpulse = 0;
   }

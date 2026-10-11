@@ -149,6 +149,11 @@ export class Mandelbrot implements Phenomenon {
     this.camera.set(re, im, log2Scale);
   }
 
+  view(): { re: string; im: string; log2Scale: number } {
+    const [re, im] = this.camera.centerDecimal();
+    return { re, im, log2Scale: this.camera.log2Scale };
+  }
+
   get cameraState(): DeepCamera {
     return this.camera;
   }
