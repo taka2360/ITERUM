@@ -539,7 +539,6 @@ fn iterate_direct(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   }
   if (bad2(g)) { g = vec2<f32>(1e30, 0.0); }
   (*s).dr = z.x; (*s).di = z.y; (*s).gr = g.x; (*s).gi = g.y; (*s).n = n;
-  atomicAdd(&counters.unfinished, 1u);
 }
 
 // ---- perturbation with f32 deltas (MODE 2) ---------------------------------
@@ -566,8 +565,8 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
       stop_pixel(s, pix, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     var stepped = false;
@@ -621,17 +620,16 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       var lg = 0.5 * log2(dot(g, g));
       if (bad2(g)) { lg = 120.0; }
       finish_escaped(s, idx, z, lg);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     if (m >= last && r2 >= dot(d, d) && P.orbit_wait != 0u) {
       (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
       (*s).status = 5u;
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-      atomicAdd(&counters.unfinished, 1u);
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     if (r2 < dot(d, d) || m >= last) {
@@ -645,8 +643,8 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).n = n;
       (*s).rebases += rebases;
       finish_cycling(s, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     cyc_len++;
@@ -655,9 +653,8 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   if (bad2(g)) { g = vec2<f32>(1e30, 0.0); }
   (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
   (*s).rebases += rebases;
-  atomicAdd(&counters.rebases, rebases);
-  if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-  atomicAdd(&counters.unfinished, 1u);
+  pv_rebases += rebases;
+  pv_bla += skipped;
 }
 
 // ---- perturbation with floatexp deltas (MODE 3) ----------------------------
@@ -687,8 +684,8 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
       stop_pixel(s, pix, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     var stepped = false;
@@ -742,8 +739,8 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
         (*s).n = n;
         let lg = log2(length(g.v)) + f32(g.e);
         finish_escaped(s, idx, zf, lg);
-        atomicAdd(&counters.rebases, rebases);
-        if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+        pv_rebases += rebases;
+        pv_bla += skipped;
         return;
       }
     }
@@ -754,9 +751,8 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
       (*s).status = 5u;
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-      atomicAdd(&counters.unfinished, 1u);
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     if (closer || m >= last) {
@@ -770,8 +766,8 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).n = n;
       (*s).rebases += rebases;
       finish_cycling(s, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     cyc_len++;
@@ -781,13 +777,44 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   (*s).gr = g.v.x; (*s).gi = g.v.y; (*s).ge = g.e;
   (*s).m = m; (*s).n = n;
   (*s).rebases += rebases;
-  atomicAdd(&counters.rebases, rebases);
-  if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-  atomicAdd(&counters.unfinished, 1u);
+  pv_rebases += rebases;
+  pv_bla += skipped;
 }
 
 // Running (or waiting for a longer orbit) after this pass: stays in the list.
 var<private> still_active: bool;
+// The pixel waits for a longer orbit; rebases and BLA-skipped iterations of
+// this pass. Summed per workgroup (tally) instead of a global atomic per pixel.
+var<private> waiting_now: bool;
+var<private> pv_rebases: u32;
+var<private> pv_bla: u32;
+var<workgroup> wg_tally: array<atomic<u32>, 6>;
+
+// Adds the pixel's tallies; called by every invocation of the group in
+// uniform control flow, then one invocation adds the group's sums.
+fn tally(li: u32, step: u32) {
+  if (li == 0u) { for (var k = 0u; k < 6u; k++) { atomicStore(&wg_tally[k], 0u); } }
+  workgroupBarrier();
+  if (still_active) {
+    atomicAdd(&wg_tally[0], 1u);
+    if (step == 0u) { atomicAdd(&wg_tally[1], 1u); }
+    if (step == 1u) { atomicAdd(&wg_tally[2], 1u); }
+  }
+  if (waiting_now) { atomicAdd(&wg_tally[3], 1u); }
+  if (pv_rebases > 0u) { atomicAdd(&wg_tally[4], pv_rebases); }
+  if (pv_bla > 0u) { atomicAdd(&wg_tally[5], pv_bla); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let t = array<u32, 6>(atomicLoad(&wg_tally[0]), atomicLoad(&wg_tally[1]), atomicLoad(&wg_tally[2]),
+                          atomicLoad(&wg_tally[3]), atomicLoad(&wg_tally[4]), atomicLoad(&wg_tally[5]));
+    if (t[0] > 0u) { atomicAdd(&counters.unfinished, t[0]); }
+    if (t[1] > 0u) { atomicAdd(&counters.unfinished_coarse, t[1]); }
+    if (t[2] > 0u) { atomicAdd(&counters.unfinished_mid, t[2]); }
+    if (t[3] > 0u) { atomicAdd(&counters.waiting, t[3]); }
+    if (t[4] > 0u) { atomicAdd(&counters.rebases, t[4]); }
+    if (t[5] > 0u) { atomicAdd(&counters.bla_steps, t[5]); }
+  }
+}
 
 fn step_of(pix: vec2<u32>) -> u32 {
   if ((pix.x & 3u) == 0u && (pix.y & 3u) == 0u) { return 0u; }
@@ -799,6 +826,9 @@ fn step_of(pix: vec2<u32>) -> u32 {
 // step-2 budget; coarser steps get more); returns the number of iterations it moved forward.
 fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
   still_active = false;
+  waiting_now = false;
+  pv_rebases = 0u;
+  pv_bla = 0u;
   bla_saved = 0u;
   loop_steps = 0u;
   budget = max(16u, P.budget << (2u - step));
@@ -820,11 +850,8 @@ fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
     if (s.m + 1u < P.orbit_len || P.orbit_wait == 0u) {
       s.status = 0u;
     } else {
-      atomicAdd(&counters.unfinished, 1u);
-      atomicAdd(&counters.waiting, 1u);
-      if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
-      if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
       still_active = true;
+      waiting_now = true;
       return 0u;
     }
   }
@@ -839,12 +866,8 @@ fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
   }
   state[idx] = s;
   loop_steps = s.n - n0 - bla_saved;
-  if (s.status == 5u) { atomicAdd(&counters.waiting, 1u); }
-  if (s.status == 0u || s.status == 5u) {
-    if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
-    if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
-    still_active = true;
-  }
+  waiting_now = s.status == 5u;
+  still_active = s.status == 0u || s.status == 5u;
   return min(s.n - n0, 1u << 25u);
 }
 
@@ -881,6 +904,7 @@ fn iterate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
     atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u);
     add_steps(atomicLoad(&wg_steps));
   }
+  tally(li, P.step);
 }
 
 fn list_read(which: u32, i: u32) -> u32 {
@@ -949,6 +973,7 @@ fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) 
     atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u);
     add_steps(atomicLoad(&wg_steps));
   }
+  tally(li, entry >> 30u);
   list_append(li, keep, entry, 1u - P.list_in);
 }
 

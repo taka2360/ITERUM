@@ -19,7 +19,7 @@
 // webgpu.txt} for the CUDA benchmark (src-tauri/examples/cuda).
 // ITERUM_PROVEN=0 disables the proven-interior tests (ITERUM_PATCHES=0 only
 // the component proofs), ITERUM_TRAP sets the fewest shading steps of proven
-// pixels.
+// pixels, ITERUM_SHARE the share of a frame the iteration may take.
 
 import type { App } from "../main";
 import { DeepCamera } from "../core/camera2d";
@@ -283,10 +283,12 @@ export async function runGolden(app: App): Promise<void> {
   const cap = await envVar("ITERUM_CAP");
   const proven = (await envVar("ITERUM_PROVEN")) !== "0";
   const trap = await envVar("ITERUM_TRAP");
+  const share = await envVar("ITERUM_SHARE");
   experiment = (e) => {
     if (cap) e.maxIterCap = Math.min(e.maxIterCap, Number(cap));
     e.provenInterior = proven;
     if (trap) e.trapIters = Number(trap);
+    if (share) e.stillShare = Number(share);
   };
   usePatches = proven && (await envVar("ITERUM_PATCHES")) !== "0";
   for (const gv of GOLDEN_VIEWS.filter((v) => !only || only.split(",").includes(v.name))) {
