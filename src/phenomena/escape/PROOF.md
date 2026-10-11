@@ -84,48 +84,75 @@ and uses E = 2⁻¹⁶ T̃ ≥ 2⁻¹⁷ T. The pixel is proven interior when
 which implies v_exact < 0. In direct mode C = 0 and d = c, with the same
 evaluation.
 
-## 2. Any hyperbolic component: a disc mapped into itself
+## 2. Any hyperbolic component: Krawczyk on Taylor models
 
-**Theorem (Earle–Hamilton, one-variable case).** Let F be holomorphic on a
-neighbourhood of a closed disc B and F(B) ⊂ int B. Then F has exactly one fixed
-point in B, it is attracting, and every point of B converges to it.
+**Statement.** If f_c has a periodic point z of period dividing p with
+|(f_c^p)'(z)| < 1, the cycle of z attracts, c lies in a hyperbolic component
+and therefore in the interior of M. As in section 1, this is a statement
+about c alone; the pixel's own orbit plays no part.
 
-With F = f_c^p this gives an attracting periodic orbit of f_c, which places c
-in a hyperbolic component, i.e. in the interior of M. The statement is about c
-alone: nothing depends on how accurately the pixel's own orbit was computed.
+**Why not a disc mapped into itself, evaluated per pixel in f32.** The
+reported slow views sit next to a component's boundary, where
+1 − |λ| ≈ 1e-8 … 1e-7. A disc on which f_c^p contracts then has a radius of
+order 1 − |λ| relative to |z|, far below what f32 resolves, so such a test
+could not prove these pixels. The proof is therefore done on the CPU, once
+per tile of the image, in f64 with outward rounding, and the GPU only
+evaluates its result.
 
-The shader proves F(B) ⊂ int B by propagating a disc enclosure (centre m,
-radius r) through p perturbation steps δ' = (2 Z_k + δ) δ + δc.
+**Patches.** The image is split into an 8 × 8 grid of tiles. For each tile
+the CPU (`component.rs`) picks a centre c0 that f64 holds exactly and a radius
+ρ (a power of two) covering the tile with a pixel to spare, and considers
+every c = c0 + ρu, |u| ≤ 1.
 
-**One step.** With δ = m + η, |η| ≤ r,
+**Taylor models.** A Taylor model is a polynomial in u of degree 8 with f64
+complex coefficients plus a remainder radius r: it encloses a function g if
+|g(u) − poly(u)| ≤ r for all |u| ≤ 1. Sums and products are formed with every
+rounding error (≤ 2^-51 relative per f64 operation, counted generously, plus
+an absolute 10^-300 for underflow) and every term of degree > 8 (bounded by
+the sum of its coefficients' moduli, since |u| ≤ 1) moved into the remainder.
+The remainder of a product is |A|·r_B + |B|·r_A + r_A·r_B with |A| bounded by
+the sum of the moduli of A's coefficients.
 
-    δ' = (2 Z_k + m) m + δc + (2 Z_k + 2m) η + η².
+**Cycle.** Newton's method on polynomials (not rigorous, only a guess) gives
+z̃(u) ≈ a periodic point of f_{c(u)}^p. With Z = z̃ + B(0, r) and
+F(z) = f^p(z) − z, the Krawczyk operator
 
-The first-order coefficient is the derivative at the centre, 2 Z_k + 2m. The
-stored reference value Ẑ_k differs from the true Z_k by at most
-e_k = 2⁻²⁴ |Ẑ_k|₁ + 2^(8 − bits) (rounding to an f32 mantissa, plus the
-fixed-point truncation of the reference computation), which changes δ' by at
-most 2 e_k |δ| ≤ 2 e_k (|m| + r). The new centre m' = fl((2Ẑ_k + m) m + δc)
-has rounding error at most ε_arith = ε (3 |2Ẑ_k + m|₁ |m|₁ + 2 |δc|₁) + 8τ (four
-real multiplications and three additions per component, bounded generously).
-Therefore the image disc is enclosed by (m', r') with
+    K = z̃ − Y F(z̃) + (1 − Y F'(Z)) (Z − z̃),   Y ≈ 1 / F'(z̃(0)),
 
-    r' ≥ |2Ẑ_k + 2m|₁ r + r² + 2 e_k (|m|₁ + r) + ε_arith,
+is enclosed as a Taylor model. If sup |Y F(z̃)| + sup |1 − Y F'(Z)| · r < r,
+then K(Z) ⊂ int Z for every u, so (the complex Krawczyk theorem) f_{c(u)}^p
+has exactly one fixed point z*(u) in Z(u).
 
-evaluated with every operation rounded up (computed value × (1 + 2⁻²⁰)).
+**Multiplier.** Λ(u) = (f^p)'(z) over the enclosure Z encloses λ(c(u)) of
+that cycle. Writing u = x + iy, the real and imaginary parts of Λ's
+polynomial are expanded into polynomials in (x, y) and |Λ|² − 1 is formed;
+terms of total degree > 4 are bounded (|x|, |y| ≤ 1) into the bound, and so
+are 2 |Λ| r_Λ + r_Λ² and the rounding of these expansions. The constant term
+loses 1 with an f64 rounding of at most 2^-52.
 
-**Rebase** (δ ← Z_k + δ): m' = fl(Ẑ_k + m), r' ≥ r + e_k + ε (|Ẑ_k|₁ + |m|₁) + τ.
+**What the GPU checks.** The record holds d0 = c0 − C (C the reference
+point; rounded to f32), the exponent of ρ, the 15 coefficients (rounded to
+f32 mantissas) and the bound B. For a pixel of the tile the shader forms
+u = (δc − d0) · 2^-ρe in f32. Its error is at most δ = 2^-22 (1 + |d0|/ρ)
+(rounding of d0 and of the difference), so the CPU adds sup |∇P| · 2δ to B,
+and the shader only uses pixels with |u|² ≤ 0.9999 (the exact u then lies in
+the unit disc). The polynomial is evaluated as in section 1 (error ≤ 2^-16 T)
+and the pixel is proven when value + 2^-16 T + B < 0. The CPU sends B with
+2^-18 of itself to spare, more than the shader's addition can lose.
 
-**Comparison.** The disc is formed and compared in absolute coordinates (the
-state right after a rebase, where δ = z). After p steps and a final rebase,
-the pixel is proven interior when
+**Choosing p.** Candidates are the iterations at which |z_n| of c0's orbit
+(2^21 steps in f64) reaches a new minimum. For each, plain Newton's method
+from points of the orbit looks for a point of a cycle of exact period p with
+|λ| < 1; only then is the Taylor-model proof attempted. Tiles whose centre
+yields nothing (it escapes, or lies outside the component) try the cycles
+found in neighbouring tiles: their disc may still reach into the component.
+None of this choice affects correctness — a wrong guess only fails to prove.
 
-    upper(|m_p − m_0|₁) + r_p < lower(r_0),
-
-where upper(x) = x (1 + 2⁻²⁰) + τ, lower(x) = x (1 − 2⁻²⁰).
-
-BLA is never used inside a proof: its validity radius is an f32-precision
-estimate, not a rigorous remainder bound.
+**Limits.** f64 holds c0 and the pixels' offsets only to about 10^-16
+relative, so patches need a radius well above that: perturbation views of
+moderate depth. Near the root where a component meets its parent, F' → 0 and
+the Krawczyk test fails on tiles that contain it; those pixels stay
+unresolved.
 
 ## 3. Shading of proven pixels (a heuristic, checked against running to the limit)
 
@@ -136,7 +163,8 @@ cycle; at the period-2 boundary view the last such pass came within 5/√η
 iterations for every sampled point. A proven pixel therefore iterates
 16/√η steps (at least 1024) and then finishes; η is estimated from the
 polynomial value (period 2: η ≈ −8 g; cardioid: η ≈ −h |λ'(c)| / |∇h| with
-λ'(c) = 2/√(1 − 4c); no shortcut near the cusp c = 1/4). If the iteration
+λ'(c) = 2/√(1 − 4c), no shortcut near the cusp c = 1/4; patches:
+η ≈ −(|λ|² − 1)/2). If the iteration
 limit comes first, the pixel pauses like any other and resumes when the limit
 is raised, so its shading is exactly what running to the limit gives
 whenever the shading steps exceed the limit.

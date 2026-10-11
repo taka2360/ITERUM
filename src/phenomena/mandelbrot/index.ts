@@ -19,7 +19,7 @@ import {
   EscapeEngine, MODE_DEEP, MODE_DIRECT, MODE_NAMES, MODE_PERTURB,
   type EscapeMode, type EscapeView, type HistoryMap,
 } from "../escape/engine";
-import { OrbitManager, hasTauri, orbitReference } from "./orbit";
+import { OrbitManager, hasTauri, orbitReference, requestPatches } from "./orbit";
 import { VOYAGES, type VoyageTarget } from "./voyages";
 
 const SUPERSCRIPT = "⁰¹²³⁴⁵⁶⁷⁸⁹";
@@ -63,6 +63,11 @@ export class Mandelbrot implements Phenomenon {
   private needsHome = true;
   private paletteDrift = 0;
   private lastSpacingLog2 = 0;
+  // Component proofs (orbit.ts, requestPatches): the view they are for, when
+  // it last changed, and whether they were requested.
+  private patchKey = "";
+  private patchSince = 0;
+  private patchAsked = false;
 
   constructor(palette: () => PaletteTexture) {
     this.engine = new EscapeEngine(palette);
@@ -145,6 +150,29 @@ export class Mandelbrot implements Phenomenon {
    */
   private orbitLength(want: number): number {
     return Math.min(Math.max(want, 4096), this.engine.maxIterCap + 1);
+  }
+
+  /**
+   * Once a perturbation view has stayed unchanged for a moment, asks for
+   * component proofs of its tiles; they apply only if it is still the view.
+   */
+  private managePatches(view: EscapeView, width: number, height: number): void {
+    const o = this.orbits?.current;
+    if (view.mode !== MODE_PERTURB || !o || view.orbit !== o) return;
+    const key = `${o.rustId}:${view.spacing.m}:${view.spacing.e}:${view.cmr[0]}:${view.cmr[1]}:${width}x${height}`;
+    const now = performance.now();
+    if (key !== this.patchKey) {
+      this.patchKey = key;
+      this.patchSince = now;
+      this.patchAsked = false;
+    }
+    if (this.patchAsked || now - this.patchSince < 250) return;
+    this.patchAsked = true;
+    requestPatches(o, view, width, height)
+      .then((buf) => {
+        if (this.patchKey === key) this.engine.setPatches(buf);
+      })
+      .catch(() => {});
   }
 
   /** Places the view at an exact location (used by benchmarks and tests). */
@@ -331,6 +359,7 @@ export class Mandelbrot implements Phenomenon {
       return this.engine.render(frame, false);
     }
     this.engine.setView(view, history);
+    this.managePatches(view, frame.width, frame.height);
     return this.engine.render(frame);
   }
 

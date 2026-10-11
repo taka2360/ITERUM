@@ -13,15 +13,16 @@
 // per-pixel status and iteration count are saved), then once at the timing
 // resolution as warm-up, then ITERUM_RUNS times (default 5) for timing.
 // Experiments: ITERUM_CAP caps the iteration limit of every view,
-// ITERUM_PROVEN=0 disables the proven-interior tests, ITERUM_TRAP sets the
-// shading steps of proven pixels.
+// ITERUM_PROVEN=0 disables the proven-interior tests (ITERUM_PATCHES=0 only
+// the component proofs), ITERUM_TRAP sets the fewest shading steps of proven
+// pixels.
 
 import type { App } from "../main";
 import { DeepCamera } from "../core/camera2d";
 import { feFromLog2 } from "../core/floatexp";
 import { GpuTimer } from "../gpu/timing";
 import { EscapeEngine, MODE_DEEP, MODE_DIRECT, MODE_JULIA, MODE_PERTURB, MODE_NAMES, type EscapeView } from "../phenomena/escape/engine";
-import { OrbitManager, orbitReference, type OrbitInfo } from "../phenomena/mandelbrot/orbit";
+import { OrbitManager, orbitReference, requestPatches, type OrbitInfo } from "../phenomena/mandelbrot/orbit";
 import { VOYAGES } from "../phenomena/mandelbrot/voyages";
 import { diag, envVar, exitApp, saveFile } from "../platform";
 import { outDir, seconds } from "./harness";
@@ -100,6 +101,8 @@ export interface GoldenResult {
   orbitTotalMs?: number;
   rustMs?: { orbit: number; bla: number; encode: number };
   timedOut?: boolean;
+  /** Time to obtain the component proofs (perturbation views). */
+  patchMs?: number;
 }
 
 async function orbitFor(orbits: OrbitManager, cam: DeepCamera, log2s: number, w: number, h: number, grow = false): Promise<number> {
@@ -118,6 +121,7 @@ const sum = (os: OrbitInfo[], f: (o: OrbitInfo) => number) => +os.reduce((t, o) 
 /** Renders one view to convergence; returns the engine (caller disposes) and timings. */
 /** Experiment settings from the environment (see the header). */
 let experiment: (e: EscapeEngine) => void = () => {};
+let usePatches = true;
 
 export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManager, w = W, h = H, configure?: (e: EscapeEngine) => void): Promise<{ engine: EscapeEngine; result: GoldenResult }> {
   let view: EscapeView;
@@ -142,6 +146,14 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
   experiment(engine);
   configure?.(engine);
   const installed: OrbitInfo[] = view.orbit ? [orbits.current!] : [];
+  // Component proofs, as the app asks for them (here before the first frame).
+  let patchMs: number | undefined;
+  if (view.mode === MODE_PERTURB && usePatches) {
+    const t = performance.now();
+    engine.setView(view, null);
+    engine.setPatches(await requestPatches(orbits.current!, view, w, h));
+    patchMs = performance.now() - t;
+  }
   const device = app.gpu.device;
   const timer = new GpuTimer(device, app.gpu.hasTimestamps);
   let gpuMs = 0;
@@ -206,6 +218,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
         ? { orbit: sum(installed, (o) => o.rustMs[0]), bla: sum(installed, (o) => o.rustMs[1]), encode: sum(installed, (o) => o.rustMs[2]) }
         : undefined,
       timedOut: timedOut || undefined,
+      patchMs: patchMs !== undefined ? +patchMs.toFixed(1) : undefined,
     },
   };
 }
@@ -243,6 +256,7 @@ export async function runGolden(app: App): Promise<void> {
     e.provenInterior = proven;
     if (trap) e.trapIters = Number(trap);
   };
+  usePatches = proven && (await envVar("ITERUM_PATCHES")) !== "0";
   for (const gv of GOLDEN_VIEWS.filter((v) => !only || only.split(",").includes(v.name))) {
     const { engine, result } = await renderGolden(app, gv, orbits);
     const samples = await engine.readSamples();

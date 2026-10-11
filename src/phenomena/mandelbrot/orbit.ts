@@ -3,7 +3,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { DeepPoint } from "../../core/camera2d";
-import type { GpuOrbit } from "../escape/engine";
+import { PATCH_GRID, type GpuOrbit } from "../escape/engine";
+import type { Fe } from "../../core/floatexp";
 
 export const HEADER_WORDS = 48;
 const MAGIC = 0x4d525449;
@@ -85,6 +86,36 @@ export function orbitReference(o: { ref: DeepPoint; bits: number }): DeepPoint {
   const shift = BigInt(o.ref.frac - frac);
   const trunc = (v: bigint) => (v < 0n ? -(-v >> shift) : v >> shift);
   return { re: trunc(o.ref.re), im: trunc(o.ref.im), frac };
+}
+
+/**
+ * Asks Rust to prove the tiles of a perturbation view interior to hyperbolic
+ * components (component.rs). Tiles follow escape.wgsl: a PATCH_GRID² grid
+ * over the image; each patch is a disc around the tile centre covering it.
+ */
+export function requestPatches(o: OrbitInfo, view: { spacing: Fe; cmr: [number, number] }, width: number, height: number): Promise<ArrayBuffer> {
+  const sp = view.spacing.m * 2 ** view.spacing.e;
+  const tiles: [number, number][] = [];
+  for (let ty = 0; ty < PATCH_GRID; ty++) {
+    for (let tx = 0; tx < PATCH_GRID; tx++) {
+      // Tile centre in rel_pos coordinates (pixels from the image centre, y up).
+      const x = ((tx + 0.5) * width) / PATCH_GRID - width / 2;
+      const y = -(((ty + 0.5) * height) / PATCH_GRID - height / 2);
+      tiles.push([(x + view.cmr[0]) * sp, (y + view.cmr[1]) * sp]);
+    }
+  }
+  // Half the tile diagonal, plus a pixel for the sample jitter and the tile edges.
+  const reach = (Math.hypot(width / PATCH_GRID, height / PATCH_GRID) / 2 + 2) * sp;
+  const req = {
+    re: o.ref.re.toString(16),
+    im: o.ref.im.toString(16),
+    fracBits: o.ref.frac,
+    bits: o.bits,
+    tiles,
+    rhoLog2: Math.ceil(Math.log2(reach)),
+    maxPeriod: 4096,
+  };
+  return invoke<ArrayBuffer>("component_patches", { req });
 }
 
 export const hasTauri = (): boolean => "__TAURI_INTERNALS__" in window;

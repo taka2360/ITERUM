@@ -2,6 +2,7 @@
 //! off the UI thread and returned to the WebView as binary packets.
 
 pub mod bla;
+pub mod component;
 // Some helpers exist only for the verification tests.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod fexp;
@@ -254,6 +255,45 @@ pub async fn bla_table(state: State<'_, DeepZoomState>, mut req: BlaRequest) -> 
 #[tauri::command]
 pub fn cancel_orbit(state: State<'_, DeepZoomState>) {
     state.latest.store(0, Ordering::SeqCst);
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PatchRequest {
+    /// Reference point as for orbits (hex, scaled by 2^frac_bits).
+    pub re: String,
+    pub im: String,
+    pub frac_bits: u32,
+    pub bits: u32,
+    /// Tile centres as offsets from the reference point.
+    pub tiles: Vec<(f64, f64)>,
+    /// Patch radius 2^rho_log2 (covers a tile).
+    pub rho_log2: i32,
+    pub max_period: u32,
+}
+
+/// Interior proofs for hyperbolic components, one record per tile
+/// (component::PATCH_BYTES each, all zero where nothing was proved).
+#[tauri::command]
+pub async fn component_patches(req: PatchRequest) -> Result<Response, String> {
+    let (cr, ci) = parse_center(&req.re, &req.im, req.frac_bits, req.bits)?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let t0 = Instant::now();
+        let grid_w = (req.tiles.len() as f64).sqrt().round().max(1.0) as usize;
+        let recs = component::prove_tiles(&cr, &ci, &req.tiles, grid_w, req.rho_log2, req.max_period);
+        let mut out = vec![0u8; req.tiles.len() * component::PATCH_BYTES];
+        for (k, r) in recs.iter().enumerate() {
+            if let Some(r) = r {
+                out[k * component::PATCH_BYTES..(k + 1) * component::PATCH_BYTES].copy_from_slice(r);
+            }
+        }
+        let proved = out.chunks(component::PATCH_BYTES).filter(|r| r[12..16] != [0, 0, 0, 0]).count();
+        println!("[iterum] component patches {proved}/{} proved in {:.1}ms", req.tiles.len(), t0.elapsed().as_secs_f64() * 1e3);
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(Response::new(bytes))
 }
 
 #[derive(Deserialize)]

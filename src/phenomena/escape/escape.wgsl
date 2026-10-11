@@ -35,7 +35,11 @@
 //
 // Proven interior: when a pixel starts, the closed-form tests for the main
 // cardioid and the period-2 disk are evaluated with a rigorous error bound
-// (PROOF.md, section 1). A pixel that passes is interior for certain. It
+// (PROOF.md, section 1); in MODE 2 also the patch of its tile, if the CPU
+// proved one: |λ|² − 1 of a component's cycle as a polynomial with a bound
+// (section 2). Patches arrive while the image is computed; the retest pass
+// then checks the pixels that have not finished. A pixel that passes is
+// interior for certain. It
 // iterates only as long as its interior shading needs (shading_steps), then
 // finishes with status 6 whatever the iteration limit. The proof decides the
 // status; the shading of such a pixel is an approximation (PROOF.md, section 3).
@@ -90,7 +94,7 @@ struct Params {
   acked_raises: u32,
   budget_safe: u32,
   list_mode: u32,        // decide_limit: rebuild list 1 − list_in after a raise
-  _p3: u32,
+  patches_on: u32,       // the patch uniform holds proofs for this view
 }
 
 struct PixelState {
@@ -175,6 +179,13 @@ struct Term { m: f32, e: i32, i: u32, j: u32 }
 const G_TERMS: u32 = 6u;
 const H_TERMS: u32 = 15u;
 @group(0) @binding(11) var<uniform> terms: array<Term, 21>;
+// Component proofs, one per tile of a PATCH_GRID² grid over the image
+// (component.rs, PATCH_BYTES): |λ(u)|² − 1 for u = (δc − d0) / 2^rho_e,
+// |u| ≤ 1, with `bound` covering everything the 15 terms leave out.
+struct PatchHead { d0: vec2<f32>, rho_e: i32, period: u32, bound_m: f32, bound_e: i32, _a: u32, _b: u32 }
+struct PatchRec { head: PatchHead, t: array<Term, 15> }
+const PATCH_GRID: u32 = 8u;
+@group(0) @binding(13) var<uniform> patches: array<PatchRec, 64>;
 @group(0) @binding(10) var<storage, read_write> args: array<u32, 12>;
 
 #include floatexp
@@ -256,7 +267,8 @@ fn finish_anomaly(s: ptr<function, PixelState>, idx: u32) {
 
 const PROVEN_CARDIOID: u32 = 0x80000000u; // flags in PixelState.rebases
 const PROVEN_P2: u32 = 0x40000000u;
-const PROVEN_ANY: u32 = 0xc0000000u;
+const PROVEN_COMPONENT: u32 = 0x20000000u;
+const PROVEN_ANY: u32 = 0xe0000000u;
 
 fn fe_mul(a: FE, b: FE) -> FE { return fe_make(a.m * b.m, a.e + b.e); }
 fn fe_add(a: FE, b: FE) -> FE {
@@ -343,7 +355,11 @@ fn shading_steps(pix: vec2<u32>, flags: u32) -> u32 {
   let d = pixel_d(pix);
   var v: FE;
   var factor = 8.0;
-  if ((flags & PROVEN_CARDIOID) != 0u) {
+  if ((flags & PROVEN_COMPONENT) != 0u) {
+    // v = |λ|² − 1 ≈ −2η.
+    v = patch_eval(pix).v;
+    factor = 0.5;
+  } else if ((flags & PROVEN_CARDIOID) != 0u) {
     v = poly_eval(G_TERMS, H_TERMS, d.dx, d.dy).v;
     let c = approx_c(pix);
     let u = c.x - 0.25;
@@ -363,6 +379,54 @@ fn shading_steps(pix: vec2<u32>, flags: u32) -> u32 {
   return max(P.trap_iters, u32(exp2(max(steps_log2, 0.0))));
 }
 
+// The pixel's patch: |λ|² − 1 (v) and its error bound (e), if it has one.
+struct PatchVal { ok: bool, v: FE, e: FE }
+
+fn patch_eval(pix: vec2<u32>) -> PatchVal {
+  let none = PatchVal(false, FE(0.0, 0), FE(0.0, 0));
+  if (MODE != 2u || P.patches_on == 0u) { return none; }
+  let tx = min(pix.x * PATCH_GRID / P.size.x, PATCH_GRID - 1u);
+  let ty = min(pix.y * PATCH_GRID / P.size.y, PATCH_GRID - 1u);
+  let rec = ty * PATCH_GRID + tx;
+  let h = patches[rec].head;
+  if (h.period == 0u) { return none; }
+  // u differs from the exact (δc − d0)/ρ by at most 2^-21 (f32 rounding of
+  // d0 and of the difference; the CPU added that to the bound), so
+  // |u|² ≤ 0.9999 keeps the exact u inside the proven disc.
+  let u = ldexp(perturb_dc(pix) - h.d0, vec2<i32>(-h.rho_e));
+  if (dot(u, u) > 0.9999 || subnormal(u.x) || subnormal(u.y)) { return none; }
+  var px: array<FE, 5>;
+  var py: array<FE, 5>;
+  px[0] = FE(0.5, 1);
+  py[0] = FE(0.5, 1);
+  let ux = fe_make(u.x, 0);
+  let uy = fe_make(u.y, 0);
+  for (var k = 1u; k < 5u; k++) {
+    px[k] = fe_mul(px[k - 1u], ux);
+    py[k] = fe_mul(py[k - 1u], uy);
+  }
+  var v = FE(0.0, 0);
+  var t = FE(0.0, 0);
+  for (var k = 0u; k < 15u; k++) {
+    let a = patches[rec].t[k];
+    if (a.m == 0.0) { continue; }
+    let term = fe_mul(fe_mul(FE(a.m, a.e), px[a.i]), py[a.j]);
+    v = fe_add(v, term);
+    t = fe_add(t, FE(abs(term.m), term.e));
+  }
+  // Evaluation error (as for the closed forms) plus the patch's bound; the
+  // CPU sends the bound with 2^-18 to spare, more than this addition can lose.
+  return PatchVal(true, v, fe_add(FE(t.m, t.e - 16), FE(h.bound_m, h.bound_e)));
+}
+
+fn patch_interior(pix: vec2<u32>) -> u32 {
+  let p = patch_eval(pix);
+  if (!p.ok) { return 0u; }
+  let w = fe_add(p.v, p.e);
+  if (w.m < 0.0) { return PROVEN_COMPONENT; }
+  return 0u;
+}
+
 fn csqrt(a: vec2<f32>) -> vec2<f32> {
   let r = length(a);
   let x = sqrt(max(0.0, 0.5 * (r + a.x)));
@@ -378,8 +442,10 @@ fn approx_c(pix: vec2<u32>) -> vec2<f32> {
   return vec2<f32>(P.ref_x, P.ref_y) + cf_to_vec2(deep_dc(pix));
 }
 
-// Smallest |z|² on the attracting cycle (fixed point, or the 2-cycle).
+// Smallest |z|² on the attracting cycle (fixed point, or the 2-cycle; other
+// components: not known here).
 fn cycle_trap(c: vec2<f32>, flags: u32) -> f32 {
+  if ((flags & PROVEN_COMPONENT) != 0u) { return 1e30; }
   if ((flags & PROVEN_CARDIOID) != 0u) {
     let z = 0.5 * (vec2<f32>(1.0, 0.0) - csqrt(vec2<f32>(1.0, 0.0) - 4.0 * c));
     return dot(z, z);
@@ -737,7 +803,10 @@ fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
   var s = state[idx];
   if (s.job != P.job) {
     s = init_state(pix);
-    if (P.trap_iters != 0u && MODE != 1u) { s.rebases = closed_form_interior(pix); }
+    if (P.trap_iters != 0u && MODE != 1u) {
+      s.rebases = closed_form_interior(pix);
+      if (s.rebases == 0u) { s.rebases = patch_interior(pix); }
+    }
   }
   // Resume pixels stopped at an earlier, lower limit.
   if (s.status == 2u && s.n < max_iter) { s.status = 0u; }
@@ -877,6 +946,29 @@ fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) 
     add_steps(atomicLoad(&wg_steps));
   }
   list_append(li, keep, entry, 1u - P.list_in);
+}
+
+// Component proofs arrived: checks the current job's pixels that have not
+// finished. A pixel stopped at the limit that is proven and has iterated its
+// shading steps finishes now (it was counted as interior when it stopped).
+@compute @workgroup_size(8, 8)
+fn retest(@builtin(global_invocation_id) gid: vec3<u32>) {
+  max_iter = counters.max_iter;
+  let pix = gid.xy;
+  if (pix.x >= P.size.x || pix.y >= P.size.y || P.trap_iters == 0u) { return; }
+  let idx = pix.y * P.size.x + pix.x;
+  var s = state[idx];
+  if (s.job != P.job || (s.rebases & PROVEN_ANY) != 0u) { return; }
+  if (s.status != 0u && s.status != 2u && s.status != 5u) { return; }
+  let f = patch_interior(pix);
+  if (f == 0u) { return; }
+  s.rebases |= f;
+  if (s.status == 2u && s.n >= shading_steps(pix, s.rebases)) {
+    s.status = 6u;
+    samples[P.sample * P.size.x * P.size.y + idx] = vec2<f32>(-1.0, sqrt(s.trap));
+    atomicAdd(&counters.proven, 1u);
+  }
+  state[idx] = s;
 }
 
 // Dispatch size (x, y) for `groups` workgroups (x ≤ MAX_GROUPS_X).

@@ -122,6 +122,10 @@ const C_AGG = 21; // escaped, late, interior, cycling, proven
 const COUNTER_BYTES = 26 * 4;
 // Coefficients of the closed-form interior tests (interior.ts).
 const TERM_BYTES = 21 * 16;
+// Component proofs (component.rs): one record per tile of an 8 × 8 grid.
+export const PATCH_GRID = 8;
+const PATCH_COUNT = PATCH_GRID * PATCH_GRID;
+export const PATCH_BYTES = 32 + 15 * 16;
 // Largest per-pixel budget of a full-grid pass (list mode allows more).
 const FULL_BUDGET_MAX = 1 << 16;
 const PARAM_BYTES = 112;
@@ -173,6 +177,11 @@ export class EscapeEngine {
   private readbacks: Readback[] = [];
   private dummy!: GPUBuffer;
   private terms!: GPUBuffer;
+  // Component proofs for the current view (escape.wgsl, "Proven interior").
+  private patches!: GPUBuffer;
+  private patchesOn = false;
+  private retestPending = false;
+  private retestPipelines: GPUComputePipeline[] = [];
   private termsKey = "";
   private state?: GPUBuffer;
   private samples?: GPUBuffer;
@@ -271,6 +280,7 @@ export class EscapeEngine {
         { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: rw },
         { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: rw },
         { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 13, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
       ],
     });
     this.argsLayout = device.createBindGroupLayout({
@@ -346,6 +356,9 @@ export class EscapeEngine {
     }));
     this.dummy = device.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE });
     this.terms = device.createBuffer({ size: TERM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.patches = device.createBuffer({ size: PATCH_COUNT * PATCH_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.retestPipelines = [0, 1, 2, 3].map((mode) => pipe("retest", mode));
+    this.patchesOn = false;
     this.termsKey = "";
     this.linear = device.createSampler({ magFilter: "linear", minFilter: "linear" });
     this.restart();
@@ -396,6 +409,9 @@ export class EscapeEngine {
     this.prog.finishedAt = 0;
     this.prog.note = undefined;
     this.prog.trend = [];
+    // Component proofs belong to a view.
+    this.patchesOn = false;
+    this.retestPending = false;
   }
 
   /** Starts the view over (e.g. after the iteration limit changed). */
@@ -476,6 +492,7 @@ export class EscapeEngine {
           { binding: 8, resource: { buffer: this.lists[1] } },
           { binding: 9, resource: { buffer: this.listCtl } },
           { binding: 11, resource: { buffer: this.terms } },
+          { binding: 13, resource: { buffer: this.patches } },
         ],
       });
     this.computeGroups = this.params.map(group);
@@ -550,6 +567,7 @@ export class EscapeEngine {
         u[24] = this.raisesSeen;
         u[25] = Math.max(16, Math.round(Math.min(this.budget, FULL_BUDGET_MAX)));
         u[26] = this.listMode ? 1 : 0;
+        u[27] = this.patchesOn ? 1 : 0;
         device.queue.writeBuffer(target, 0, buf);
       };
       // Clear this frame's counters; when a job starts, also set its limit
@@ -564,8 +582,16 @@ export class EscapeEngine {
       }
       device.queue.writeBuffer(this.counters, 0, cw);
       this.writeTerms(view);
+      for (let step = 0; step < 3; step++) writeParams(this.params[step], step, 0);
+      if (this.retestPending) {
+        this.retestPending = false;
+        const pass = enc.beginComputePass({ label: "escape-retest" });
+        pass.setPipeline(this.retestPipelines[view.mode]);
+        pass.setBindGroup(0, groups[2]);
+        pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+        pass.end();
+      }
       if (!this.listMode) {
-        for (let step = 0; step < 3; step++) writeParams(this.params[step], step, 0);
         const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
         pass.setPipeline(this.pipelines[view.mode]);
         for (let step = 0; step < 3; step++) {
@@ -835,6 +861,22 @@ export class EscapeEngine {
     };
   }
 
+  /**
+   * Component proofs for the current view (component.rs records, one per
+   * tile), or null to drop them. Pixels already running are checked again.
+   * The caller ensures they belong to the view being rendered.
+   */
+  setPatches(data: ArrayBuffer | null): void {
+    if (!data) {
+      this.patchesOn = false;
+      return;
+    }
+    if (data.byteLength !== PATCH_COUNT * PATCH_BYTES) throw new Error("bad patch data");
+    this.device.queue.writeBuffer(this.patches, 0, data);
+    this.patchesOn = true;
+    this.retestPending = true;
+  }
+
   /** Coefficients of the closed-form interior tests around the view's reference point. */
   private writeTerms(view: EscapeView): void {
     const ref = view.mode === 0 ? { re: 0n, im: 0n, frac: 0 } : view.interiorRef;
@@ -895,6 +937,7 @@ export class EscapeEngine {
     this.listCtl?.destroy();
     this.listArgs?.destroy();
     this.terms?.destroy();
+    this.patches?.destroy();
     for (const r of this.readbacks) r.buffer.destroy();
   }
 }
