@@ -11,7 +11,8 @@
 import { DeepCamera, bigScaled, rescale, type DeepPoint } from "../../core/camera2d";
 import { feFromLog2 } from "../../core/floatexp";
 import type { InputFrame } from "../../core/input";
-import type { FrameContext, Phenomenon, PhenomenonMeta } from "../../core/phenomenon";
+import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo, ProgressRow } from "../../core/phenomenon";
+import { bigCount, int, percent, pow10FromLog2, seconds } from "../../ui/format";
 import type { PaletteTexture } from "../../core/palettes";
 import type { GpuContext } from "../../gpu/device";
 import {
@@ -349,6 +350,59 @@ export class Mandelbrot implements Phenomenon {
     if (dcNow > o.dcMaxLog2 || dcNow < o.dcMaxLog2 - 16) {
       orbits.rebuildBla(dcNow + 2);
     }
+  }
+
+  progress(): ProgressInfo {
+    const e = this.engine.progress();
+    const orbits = this.orbits;
+    const rows: ProgressRow[] = [];
+    const MODE_JA = ["f32 で直接計算", "", "摂動法（f32 の差分）", "摂動法（floatexp の差分）"];
+    rows.push({ label: "全体", value: percent(e.overall), bar: e.overall });
+    rows.push({ label: "粗い下描き（1/16 の画素）", value: percent(e.coarse), bar: e.coarse });
+    rows.push({ label: "中間（1/4 の画素）", value: percent(e.mid), bar: e.mid });
+    rows.push({ label: "すべての画素", value: percent(e.fine), bar: e.fine });
+    rows.push({ label: "重ね描き（アンチエイリアス）", value: `${Math.min(e.samplesDone + (e.converged ? 0 : 1), e.sampleTarget)} / ${e.sampleTarget} 枚目` });
+
+    // Reference orbit.
+    const p = orbits?.pending;
+    const pr = orbits?.progress;
+    const o = orbits?.current;
+    if (p && p.kind === "orbit" && pr) {
+      const label = pr.phase === "orbit" ? "計算中" : pr.phase === "bla" ? "BLA 表を構築中" : "転送中";
+      const frac = pr.phase === "orbit" ? pr.iterations / Math.max(1, pr.maxIter) : 1;
+      rows.push({
+        label: "基準軌道（任意精度）",
+        value: `${label}　${int(pr.iterations)} / ${int(pr.maxIter)} 反復 · ${int(pr.bits)} bit · ${seconds(pr.elapsedMs / 1000)}`,
+        bar: frac,
+      });
+    } else if (p && p.kind === "bla") {
+      rows.push({ label: "基準軌道（任意精度）", value: "BLA 表を現在の範囲に合わせて再構築中" });
+    } else if (this.mode === MODE_DIRECT && !this.holding) {
+      rows.push({ label: "基準軌道（任意精度）", value: "不要（この倍率では f32 で直接計算）" });
+    } else if (o) {
+      rows.push({
+        label: "基準軌道（任意精度）",
+        value: `${int(o.len)} 点 · ${int(o.bits)} bit${o.periodic ? " · 周期点" : ""} · BLA ${o.levels} 段 · ${seconds(o.computeMs / 1000)}`,
+      });
+    }
+    rows.push({
+      label: "精度モード",
+      value: this.holding ? "基準軌道を待っています（直前の画像を表示中）" : `${MODE_JA[this.mode]} · 画素の幅 2^${this.lastSpacingLog2.toFixed(0)} (${pow10FromLog2(this.lastSpacingLog2)})`,
+    });
+    rows.push({ label: "反復", value: `上限 ${int(e.maxIter)} · 逃げるまでの最大 ${int(e.maxEscaped)}` });
+    if (!e.converged) rows.push({ label: "処理速度", value: `${bigCount(e.iterationsPerSecond)} 反復/秒` });
+    rows.push({
+      label: e.converged ? "完成までの時間" : "経過 / 残り（推定）",
+      value: e.converged ? seconds(e.elapsedS) : `${seconds(e.elapsedS)} / ${e.etaS !== undefined ? "約 " + seconds(e.etaS) : "—"}`,
+    });
+    rows.push({ label: "画素数", value: int(e.pixels) });
+
+    let headline = e.converged ? "完成" : e.moving ? `視点の動きに合わせて毎フレーム描き直し中 — ${percent(e.sample)}` : `計算中 — ${percent(e.overall)}`;
+    if (this.holding) headline = "基準軌道を計算中";
+    else if (e.note && !e.converged) headline = e.note;
+    if (this.voyage) headline = `Voyage 中 — ${headline}`;
+    // No bottom line while moving: the per-frame figure would only flicker.
+    return { fraction: e.moving ? undefined : this.holding ? 0 : e.overall, headline, rows };
   }
 
   notice(): string | undefined {

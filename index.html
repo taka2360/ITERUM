@@ -20,6 +20,9 @@
       <nav id="selector"></nav>
       <nav id="controls">
         <button id="play" type="button"></button>
+ <button id="progress-toggle" type="button" title="計算の進み具合（P）" aria-label="計算の進み具合">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18V12" /><path d="M10 18V7" /><path d="M15 18v-8" /><path d="M20 18V5" /></svg>
+        </button>
         <button id="reset" type="button" title="視点を戻す（R）" aria-label="視点を戻す">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 12a6.5 6.5 0 1 0 2.1-4.8" /><path d="M5 4.5v3.6h3.6" /></svg>
         </button>
@@ -31,6 +34,11 @@
         <dl></dl>
       </section>
       <pre id="debug" hidden></pre>
+      <section id="progress" hidden aria-live="polite">
+        <h2 class="headline"></h2>
+        <div class="rows"></div>
+      </section>
+      <div id="progressline"><div class="fill"></div></div>
       <section id="unsupported" hidden>
         <h1>ITERUM</h1>
         <p class="reason"></p>

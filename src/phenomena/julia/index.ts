@@ -5,7 +5,8 @@
 import { Camera2D } from "../../core/camera2d";
 import { feFromLog2 } from "../../core/floatexp";
 import type { InputFrame } from "../../core/input";
-import type { FrameContext, Phenomenon, PhenomenonMeta } from "../../core/phenomenon";
+import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo } from "../../core/phenomenon";
+import { bigCount, int, percent, seconds } from "../../ui/format";
 import type { PaletteTexture } from "../../core/palettes";
 import type { GpuContext } from "../../gpu/device";
 import { EscapeEngine, MODE_JULIA, type HistoryMap } from "../escape/engine";
@@ -107,6 +108,7 @@ export class Julia implements Phenomenon {
       this.manualOffset[0] += input.altDragX * 0.0008;
       this.manualOffset[1] -= input.altDragY * 0.0008;
     }
+    this.paused = ctx.paused;
     if (!ctx.paused) {
       // One revolution every ~3 minutes, with a slow radial breath.
       this.theta += dt * 0.035;
@@ -139,6 +141,37 @@ export class Julia implements Phenomenon {
       history,
     );
     return this.engine.render(frame);
+  }
+
+  private paused = false;
+
+  progress(): ProgressInfo {
+    const e = this.engine.progress();
+    const c = `${this.c[0].toFixed(5)} ${this.c[1] < 0 ? "−" : "+"} ${Math.abs(this.c[1]).toFixed(5)}i`;
+    if (!this.paused) {
+      return {
+        headline: "c が動き続けるため、毎フレーム全画素を計算しています",
+        rows: [
+          { label: "このフレームの完了率", value: percent(e.sample), bar: e.sample },
+          { label: "反復", value: `上限 ${int(e.maxIter)} · 逃げるまでの最大 ${int(e.maxEscaped)}` },
+          { label: "処理速度", value: `${bigCount(e.iterationsPerSecond)} 反復/秒` },
+          { label: "c", value: c },
+          { label: "画素数", value: int(e.pixels) },
+        ],
+      };
+    }
+    return {
+      fraction: e.overall,
+      headline: e.converged ? "完成（停止中）" : `計算中 — ${percent(e.overall)}`,
+      rows: [
+        { label: "全体", value: percent(e.overall), bar: e.overall },
+        { label: "すべての画素", value: percent(e.fine), bar: e.fine },
+        { label: "重ね描き（アンチエイリアス）", value: `${Math.min(e.samplesDone + (e.converged ? 0 : 1), e.sampleTarget)} / ${e.sampleTarget} 枚目` },
+        { label: "反復", value: `上限 ${int(e.maxIter)} · 逃げるまでの最大 ${int(e.maxEscaped)}` },
+        { label: e.converged ? "完成までの時間" : "経過", value: seconds(e.elapsedS) },
+        { label: "c", value: c },
+      ],
+    };
   }
 
   debug(): Record<string, string> {

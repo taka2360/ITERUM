@@ -23,7 +23,7 @@ import { VOYAGES } from "../phenomena/mandelbrot/voyages";
 import { integrate } from "../phenomena/lorenz/reference";
 import lorenzSrc from "../phenomena/lorenz/lorenz.wgsl?raw";
 import floatexpTestSrc from "./floatexp_test.wgsl?raw";
-import { diag, exitApp } from "../platform";
+import { diag, envVar, exitApp } from "../platform";
 import { frames, seconds, shot } from "./harness";
 
 interface Result {
@@ -390,6 +390,111 @@ async function testControls(app: App): Promise<void> {
   report("controls", ok, notes.join("; "));
 }
 
+// ---- colour stability --------------------------------------------------------
+
+async function pixelsOf(png: Uint8Array): Promise<Uint8ClampedArray> {
+  const bmp = await createImageBitmap(new Blob([png as Uint8Array<ArrayBuffer>], { type: "image/png" }));
+  const c = new OffscreenCanvas(bmp.width, bmp.height);
+  const g = c.getContext("2d")!;
+  g.drawImage(bmp, 0, 0);
+  return g.getImageData(0, 0, bmp.width, bmp.height).data;
+}
+
+/** The image must not change colour when computation finishes (only edges refine). */
+async function testColourStability(app: App): Promise<void> {
+  app.select(0);
+  await seconds(2);
+  const m = app.phenomena[0] as import("../phenomena/mandelbrot").Mandelbrot;
+  const notes: string[] = [];
+  let ok = true;
+  const views: [string, string, number][] = [
+    ["-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", Math.log2(1e-12)],
+    [VOYAGES[2].re, VOYAGES[2].im, -VOYAGES[2].depthLog2 + 3],
+  ];
+  for (const [re, im, w] of views) {
+    m.setView(re, im, w - Math.log2(app.canvas.width));
+    let mid: Uint8ClampedArray | undefined;
+    const t0 = performance.now();
+    let lastStage = "";
+    const stageLog: string[] = [];
+    const meanOf = (d: Uint8ClampedArray) => {
+      let s = 0;
+      for (let i = 0; i < d.length; i += 4 * 31) s += d[i] + d[i + 1] + d[i + 2];
+      return (s / (d.length / (4 * 31)) / 3).toFixed(1);
+    };
+    while (performance.now() - t0 < 30000) {
+      await frames(app, 1);
+      const p = m.progress();
+      const e = p.rows.find((r) => r.label.startsWith("重ね描き"))?.value ?? "";
+      if (e !== lastStage) {
+        lastStage = e;
+        const img = await pixelsOf(await app.capture());
+        const look = (m as unknown as { engine: { look: { sMin: number }; maxIter: number } }).engine;
+        stageLog.push(`[${e.replace(" 枚目", "")} mean ${meanOf(img)} sMin ${look.look.sMin} maxIter ${look.maxIter}]`);
+        if (!mid && /^2 \//.test(e)) mid = img;
+      }
+      if (p.fraction === 1) break;
+    }
+    notes.push(stageLog.join(" "));
+    await frames(app, 5);
+    const fin = await pixelsOf(await app.capture());
+    if (!mid) {
+      ok = false;
+      notes.push("no midway capture");
+      continue;
+    }
+    const mean = (d: Uint8ClampedArray) => {
+      const s = [0, 0, 0];
+      for (let i = 0; i < d.length; i += 4 * 31) for (let c = 0; c < 3; c++) s[c] += d[i + c];
+      const n = d.length / (4 * 31);
+      return s.map((x) => x / n);
+    };
+    const a = mean(mid);
+    const b = mean(fin);
+    const shift = Math.max(...a.map((x, i) => Math.abs(x - b[i])));
+    if (shift > 3) ok = false;
+    notes.push(`mean RGB midway ${a.map((x) => x.toFixed(1)).join("/")} → final ${b.map((x) => x.toFixed(1)).join("/")} (max shift ${shift.toFixed(2)})`);
+  }
+  report("colour-stability", ok, notes.join("; "));
+}
+
+// ---- progress reporting --------------------------------------------------------
+
+async function testProgress(app: App): Promise<void> {
+  app.select(0);
+  await seconds(0.5);
+  const m = app.phenomena[0] as import("../phenomena/mandelbrot").Mandelbrot;
+  const v = VOYAGES.find((t) => t.name === "Abyssal Plain")!;
+  app.overlay.toggle("progress");
+  m.setView(v.re, v.im, -v.depthLog2 + 4 - Math.log2(app.canvas.width));
+  const seen = { minFraction: 1, orbitRow: false, rate: 0, headlines: new Set<string>() };
+  const t0 = performance.now();
+  let done = false;
+  while (performance.now() - t0 < 60000) {
+    await frames(app, 1);
+    const p = m.progress();
+    seen.minFraction = Math.min(seen.minFraction, p.fraction ?? 1);
+    seen.headlines.add(p.headline.split(" — ")[0]);
+    if (p.rows.some((r) => r.label.startsWith("基準軌道") && r.value.includes("bit"))) seen.orbitRow = true;
+    const rate = p.rows.find((r) => r.label === "処理速度");
+    if (rate) seen.rate = Math.max(seen.rate, parseFloat(rate.value));
+    if (p.fraction === 1 && p.headline.includes("完成")) {
+      done = true;
+      break;
+    }
+  }
+  await seconds(0.3);
+  const panelRows = document.querySelectorAll("#progress .row").length;
+  const panelHeadline = document.querySelector("#progress .headline")?.textContent ?? "";
+  app.overlay.toggle("progress");
+  const ok = done && seen.minFraction < 1 && seen.orbitRow && seen.rate > 0 && panelRows >= 8;
+  report(
+    "progress",
+    ok,
+    `10^-1000 view: started at ${(seen.minFraction * 100).toFixed(0)}%, reached 完成 ${done}, orbit row ${seen.orbitRow}, throughput seen ${seen.rate > 0}, panel rows ${panelRows} ("${panelHeadline}"), headlines: ${[...seen.headlines].join(" / ")}`,
+  );
+}
+
 export async function runGpuTests(app: App): Promise<void> {
   await seconds(1);
   const steps: [string, () => Promise<void>][] = [];
@@ -405,8 +510,11 @@ export async function runGpuTests(app: App): Promise<void> {
   steps.push(["deep-1e-300", () => deepView(app, v("Seahorse Abyss").re, v("Seahorse Abyss").im, -v("Seahorse Abyss").depthLog2 + 2, "auto", 50000, "escape-floatexp-1e-300", orbits)]);
   steps.push(["modes", () => testModesAgree(app, orbits)]);
   steps.push(["controls", () => testControls(app)]);
+  steps.push(["progress", () => testProgress(app)]);
+  steps.push(["colour", () => testColourStability(app)]);
   steps.push(["device-loss", () => testDeviceLoss(app)]);
-  for (const [name, fn] of steps) {
+  const only = await envVar("ITERUM_ONLY");
+  for (const [name, fn] of only ? steps.filter(([n]) => only.split(",").includes(n)) : steps) {
     try {
       await fn();
     } catch (e) {

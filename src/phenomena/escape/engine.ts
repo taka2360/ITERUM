@@ -50,6 +50,32 @@ export interface HistoryMap {
   offset: [number, number];
 }
 
+/** Detailed progress of the current view (see EscapeEngine.progress). */
+export interface EscapeProgress {
+  /** Completion of each progressive step of the current sample (0..1). */
+  coarse: number;
+  mid: number;
+  fine: number;
+  /** Completion of the current sample, and of the whole view (all samples). */
+  sample: number;
+  overall: number;
+  samplesDone: number;
+  sampleTarget: number;
+  converged: boolean;
+  /** The view changes every frame (dragging, zooming, Voyage): figures are per frame. */
+  moving: boolean;
+  /** Iterations advanced per second (BLA spans counted in full). */
+  iterationsPerSecond: number;
+  elapsedS: number;
+  /** Estimated seconds left, if the trend allows an estimate. */
+  etaS?: number;
+  maxIter: number;
+  maxEscaped: number;
+  /** Why the view was started over, if it was (e.g. iteration limit raised). */
+  note?: string;
+  pixels: number;
+}
+
 export interface EscapeStats {
   job: number;
   samplesDone: number;
@@ -70,6 +96,7 @@ const COUNTER_BYTES = 48;
 const PARAM_BYTES = 80;
 const DISPLAY_BYTES = 96;
 const STATE_BYTES = 48;
+// display.wgsl averages up to this many samples (unrolled); keep both in step.
 const MAX_SAMPLES = 4;
 
 // Jitter offsets for supersampling (first sample at the pixel centre).
@@ -192,7 +219,7 @@ export class EscapeEngine {
     for (const t of this.outputs) t.destroy();
     const device = this.device;
     this.state = device.createBuffer({ size: Math.max(64, w * h * STATE_BYTES), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    this.samples = device.createBuffer({ size: Math.max(64, w * h * 8 * MAX_SAMPLES), usage: GPUBufferUsage.STORAGE });
+    this.samples = device.createBuffer({ size: Math.max(64, w * h * 8 * MAX_SAMPLES), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     this.outputs = [0, 1].map(() =>
       device.createTexture({
         size: [w, h],
@@ -206,8 +233,33 @@ export class EscapeEngine {
     this.restart();
   }
 
+  private prog = {
+    viewStart: performance.now(),
+    finishedAt: 0,
+    coarse: -1,
+    mid: -1,
+    rate: [] as { t: number; n: number }[],
+    trend: [] as { t: number; f: number }[],
+    note: undefined as string | undefined,
+    sMinLocked: false,
+    anyUnfinished: -1,
+    anyCoarse: -1,
+    anyMid: -1,
+  };
+
+  private newView(): void {
+    this.prog.sMinLocked = false;
+    this.prog.viewStart = performance.now();
+    this.prog.finishedAt = 0;
+    this.prog.note = undefined;
+    this.prog.trend = [];
+  }
+
   /** Starts the view over (e.g. after the iteration limit changed). */
   restart(): void {
+    this.prog.coarse = this.prog.mid = -1;
+    this.prog.finishedAt = 0;
+    this.prog.trend = [];
     this.job++;
     this.sample = 0;
     this.samplesDone = 0;
@@ -229,6 +281,7 @@ export class EscapeEngine {
     this.view = view;
     if (history || !prev || prev.mode !== view.mode || prev.orbit !== view.orbit) {
       this.hist = history ?? { scale: 1, offset: [0, 0] };
+      this.newView();
       this.restart();
     } else {
       this.hist = { scale: 1, offset: [0, 0] };
@@ -407,24 +460,40 @@ export class EscapeEngine {
   }
 
   private onCounters(job: number, sample: number, c: Uint32Array): void {
+    // Throughput counts all work, including frames of superseded jobs.
+    const now = performance.now();
+    const pr = this.prog;
+    pr.rate.push({ t: now, n: c[11] * 256 });
+    while (pr.rate.length > 2 && now - pr.rate[0].t > 1000) pr.rate.shift();
+    pr.anyUnfinished = c[0];
+    pr.anyCoarse = c[9];
+    pr.anyMid = c[10];
     if (job !== this.job || sample !== this.sample) return;
+    pr.coarse = c[9];
+    pr.mid = c[10];
     const a = this.agg;
+    if (c[6] !== 0xffffffff) a.minN = Math.min(a.minN, c[6]);
+    // Fix the colour reference (fastest escape) while the coarse preview is
+    // still being drawn, so colours never shift when the image completes.
+    if (this.sample === 0 && !pr.sMinLocked && a.minN !== Infinity) {
+      this.look.sMin = a.minN;
+      if (c[9] === 0) pr.sMinLocked = true;
+    }
     a.unfinished = c[0];
     a.escaped += c[1];
     a.interior += c[2];
     a.anomalies += c[3];
     a.rebases += c[4];
     a.maxN = Math.max(a.maxN, c[5]);
-    if (c[6] !== 0xffffffff) a.minN = Math.min(a.minN, c[6]);
     a.blaSteps += c[7];
     a.late += c[8];
     if (c[0] !== 0) return;
     // Sample complete.
     this.lastComplete = this.stats();
     if (this.sample === 0) {
-      if (a.minN !== Infinity) this.look.sMin = a.minN;
       if (this.wantsMoreIterations()) {
         this.maxIter = Math.min(this.maxIterCap, this.maxIter * 2);
+        this.prog.note = `反復上限を ${this.maxIter.toLocaleString()} に引き上げて再計算中`;
         this.restart();
         return;
       }
@@ -432,6 +501,8 @@ export class EscapeEngine {
     this.samplesDone++;
     if (this.samplesDone >= this.sampleTarget) {
       this.converged = true;
+      this.prog.finishedAt = performance.now();
+      this.prog.note = undefined;
       return;
     }
     this.sample = this.samplesDone;
@@ -454,6 +525,60 @@ export class EscapeEngine {
     return a.late > Math.max(16, a.escaped * 0.002);
   }
 
+  progress(): EscapeProgress {
+    const w = this.width;
+    const h = this.height;
+    const pixels = w * h;
+    const half = Math.ceil(w / 2) * Math.ceil(h / 2);
+    const nCoarse = Math.ceil(w / 4) * Math.ceil(h / 4);
+    const nMid = half - nCoarse;
+    const nFine = pixels - half;
+    const pr = this.prog;
+    const a = this.agg;
+    const now = performance.now();
+    let known = a.unfinished >= 0 && pr.coarse >= 0;
+    let [left, leftCoarse, leftMid] = [a.unfinished, pr.coarse, pr.mid];
+    // While the view keeps changing, readbacks always belong to an earlier
+    // frame's view; report those per-frame figures instead of a stuck 0%.
+    const moving = !known && !this.converged && now - pr.viewStart < 400 && pr.anyUnfinished >= 0;
+    if (moving) {
+      known = true;
+      [left, leftCoarse, leftMid] = [pr.anyUnfinished, pr.anyCoarse, pr.anyMid];
+    }
+    const frac = (l: number, n: number) => (n > 0 ? 1 - Math.min(Math.max(l, 0), n) / n : 1);
+    const coarse = this.converged ? 1 : known ? frac(leftCoarse, nCoarse) : 0;
+    const mid = this.converged ? 1 : known ? frac(leftMid, nMid) : 0;
+    const fine = this.converged ? 1 : known ? frac(left - leftCoarse - leftMid, nFine) : 0;
+    const sample = this.converged ? 1 : known ? frac(left, pixels) : 0;
+    const overall = this.converged ? 1 : Math.min(1, (this.samplesDone + sample) / this.sampleTarget);
+    const rate =
+      pr.rate.length > 1 && !this.converged
+        ? pr.rate.slice(1).reduce((s, r) => s + r.n, 0) / Math.max(1e-3, (pr.rate[pr.rate.length - 1].t - pr.rate[0].t) / 1000)
+        : 0;
+    // ETA from the trend of overall completion over the last few seconds.
+    pr.trend.push({ t: now, f: overall });
+    while (pr.trend.length > 2 && now - pr.trend[0].t > 3000) pr.trend.shift();
+    let etaS: number | undefined;
+    const first = pr.trend[0];
+    if (!this.converged && first && now - first.t > 500 && overall > first.f) {
+      etaS = ((1 - overall) * (now - first.t)) / (overall - first.f) / 1000;
+    }
+    return {
+      coarse, mid, fine, sample, overall,
+      samplesDone: this.samplesDone,
+      sampleTarget: this.sampleTarget,
+      converged: this.converged,
+      moving,
+      iterationsPerSecond: rate,
+      elapsedS: ((this.converged ? pr.finishedAt : now) - pr.viewStart) / 1000,
+      etaS,
+      maxIter: this.maxIter,
+      maxEscaped: a.maxN,
+      note: pr.note,
+      pixels,
+    };
+  }
+
   /** Lowers the iteration limit after zooming out (called on view changes). */
   relaxIterations(): void {
     const s = this.lastComplete;
@@ -474,6 +599,20 @@ export class EscapeEngine {
     staging.unmap();
     staging.destroy();
     return { f: new Float32Array(copy), u: new Uint32Array(copy), width: this.width, height: this.height };
+  }
+
+  /** Copies the finished samples to the CPU (tests only). */
+  async readSamples(): Promise<Float32Array> {
+    const size = this.width * this.height * 8 * MAX_SAMPLES;
+    const staging = this.device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(this.samples!, 0, staging, 0, size);
+    this.device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    return out;
   }
 
   /** Current job id (tests use it to know which pixels belong to the view). */

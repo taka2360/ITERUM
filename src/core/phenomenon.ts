@@ -43,6 +43,21 @@ export interface FrameContext {
 
 export type RenderStatus = "refining" | "converged";
 
+export interface ProgressRow {
+  label: string;
+  value: string;
+  /** Optional 0..1 bar drawn under the value. */
+  bar?: number;
+}
+
+/** What the progress panel shows for the active phenomenon. */
+export interface ProgressInfo {
+  /** 0..1 while an image is converging; undefined for continuous animation. */
+  fraction?: number;
+  headline: string;
+  rows: ProgressRow[];
+}
+
 export interface Phenomenon {
   readonly meta: PhenomenonMeta;
   /** Creates GPU resources; called again after device loss with a new context. */
@@ -55,6 +70,8 @@ export interface Phenomenon {
   onKey?(key: string): boolean;
   /** Key/value lines for the debug overlay. */
   debug?(): Record<string, string>;
+  /** Detailed computation progress for the progress panel. */
+  progress?(): ProgressInfo;
   /** Short status line shown subtly (e.g. "computing reference"). */
   notice?(): string | undefined;
   /** Returns the view (camera) to its starting point; the simulation keeps running. */

@@ -63,8 +63,12 @@ struct Counters {
   min_escaped_n: atomic<u32>,
   bla_steps: atomic<u32>,
   late_escapes: atomic<u32>,   // escaped after more than max_iter / 2 iterations
-  _pad0: u32, _pad1: u32, _pad2: u32,
+  unfinished_coarse: atomic<u32>, // still running after this frame, step 0 pixels
+  unfinished_mid: atomic<u32>,    // ... step 1 pixels
+  iterations256: atomic<u32>,     // iterations advanced this frame / 256 (BLA spans count fully)
 }
+
+var<workgroup> wg_iterations: atomic<u32>;
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read_write> state: array<PixelState>;
@@ -333,19 +337,20 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   atomicAdd(&counters.unfinished, 1u);
 }
 
-@compute @workgroup_size(8, 8)
-fn iterate(@builtin(global_invocation_id) gid: vec3<u32>) {
+// Advances one pixel; returns the number of iterations it moved forward.
+fn process(gid: vec3<u32>) -> u32 {
   let stride = 1u << (2u - P.step);
   let pix = gid.xy * stride;
-  if (pix.x >= P.size.x || pix.y >= P.size.y) { return; }
+  if (pix.x >= P.size.x || pix.y >= P.size.y) { return 0u; }
   if (P.step > 0u) {
     let coarse = stride * 2u;
-    if (pix.x % coarse == 0u && pix.y % coarse == 0u) { return; }
+    if (pix.x % coarse == 0u && pix.y % coarse == 0u) { return 0u; }
   }
   let idx = pix.y * P.size.x + pix.x;
   var s = state[idx];
   if (s.job != P.job) { s = init_state(pix); }
-  if (s.status != 0u) { return; }
+  if (s.status != 0u) { return 0u; }
+  let n0 = s.n;
   if (MODE <= 1u) {
     iterate_direct(&s, pix, idx);
   } else if (MODE == 2u) {
@@ -354,4 +359,19 @@ fn iterate(@builtin(global_invocation_id) gid: vec3<u32>) {
     iterate_deep(&s, pix, idx);
   }
   state[idx] = s;
+  if (s.status == 0u) {
+    if (P.step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
+    if (P.step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
+  }
+  return min(s.n - n0, 1u << 25u);
+}
+
+@compute @workgroup_size(8, 8)
+fn iterate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  if (li == 0u) { atomicStore(&wg_iterations, 0u); }
+  workgroupBarrier();
+  // One global atomic per workgroup keeps the throughput counter cheap.
+  atomicAdd(&wg_iterations, process(gid));
+  workgroupBarrier();
+  if (li == 0u) { atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u); }
 }

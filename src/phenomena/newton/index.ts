@@ -3,7 +3,8 @@
 
 import { Camera2D } from "../../core/camera2d";
 import type { InputFrame } from "../../core/input";
-import type { FrameContext, Phenomenon, PhenomenonMeta } from "../../core/phenomenon";
+import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo } from "../../core/phenomenon";
+import { int } from "../../ui/format";
 import { hexToRgb, type PaletteTexture } from "../../core/palettes";
 import { shaderModule, type GpuContext } from "../../gpu/device";
 import { wgsl } from "../../shaders";
@@ -177,6 +178,7 @@ export class Newton implements Phenomenon {
     const cam = this.camera;
     const roots = this.roots();
     const samples = frame.pixelRatio > 1.01 ? 1 : 4;
+    this.lastFrame = { samples, pixels: frame.width * frame.height, paused: frame.paused };
     const relax = 1 + 0.06 * Math.sin(this.phase * 0.031);
     const palOffset = this.phase * 0.002;
     const interior = hexToRgb(pal.palette.interior);
@@ -203,6 +205,22 @@ export class Newton implements Phenomenon {
       pass.end();
     }
     return { output: this.output, status: "converged" };
+  }
+
+  private lastFrame = { samples: 4, pixels: 0, paused: false };
+
+  progress(): ProgressInfo {
+    const f = this.lastFrame;
+    return {
+      headline: f.paused ? "停止中 — 画像は確定しています" : "根が動くため、毎フレーム全画素を描き直しています",
+      rows: [
+        { label: "描画方式", value: "1 回の描画で全画素を計算（毎フレーム完了）" },
+        { label: "画素あたりの標本", value: `${f.samples}（回転格子の重ね描き）` },
+        { label: "ニュートン法の反復", value: "最大 64 回 · 根から 10⁻³ 以内で収束とみなす" },
+        { label: "多項式", value: `${PRESETS[this.preset].name}（根 ${PRESETS[this.preset].n} 個）` },
+        { label: "画素数", value: int(f.pixels) },
+      ],
+    };
   }
 
   debug(): Record<string, string> {

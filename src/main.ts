@@ -189,6 +189,7 @@ export class App {
       case "i": case "I": this.overlay.toggle("info"); break;
       case "?": case "/": this.overlay.toggle("help"); break;
       case "d": case "D": this.overlay.toggle("debug"); break;
+      case "p": case "P": this.overlay.toggle("progress"); this.lastProgressUpdate = 0; break;
       case "q": case "Q": {
         const next = QUALITY_ORDER[(QUALITY_ORDER.indexOf(this.governor.mode) + 1) % QUALITY_ORDER.length];
         this.governor.setMode(next);
@@ -256,6 +257,7 @@ export class App {
     this.overlay.setNotice(active.notice?.());
     this.syncControls();
     if (this.overlay.isOpen("debug")) this.updateDebug(rafMs, cpuMs, width, height);
+    this.updateProgress(now, rafMs, width, height);
     this.onFrame?.({ now, rafMs, cpuMs });
   }
 
@@ -293,6 +295,23 @@ export class App {
         done(new Uint8Array(await blob.arrayBuffer()));
       });
     };
+  }
+
+  private lastProgressUpdate = 0;
+  private fps = 60;
+
+  /** Progress line every frame; the detailed panel ~8 times per second. */
+  private updateProgress(now: number, rafMs: number, w: number, h: number): void {
+    this.fps += (1000 / Math.max(rafMs, 1) - this.fps) * 0.05;
+    const info = this.active.progress?.();
+    this.overlay.setProgressLine(info?.fraction);
+    if (!info || !this.overlay.isOpen("progress") || now - this.lastProgressUpdate < 120) return;
+    this.lastProgressUpdate = now;
+    const gpu = this.timer.enabled && this.timer.frames > 0 ? `${this.timer.frameMs.toFixed(1)} ms` : "計測不可";
+    this.overlay.setProgress(info.headline, [
+      ...info.rows,
+      { label: "GPU 時間 / フレーム", value: `${gpu} · ${this.fps.toFixed(0)} fps · 内部解像度 ${w}×${h}` },
+    ]);
   }
 
   private updateDebug(rafMs: number, cpuMs: number, w: number, h: number): void {

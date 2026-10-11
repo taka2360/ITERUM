@@ -77,7 +77,7 @@ mod tests {
 
     fn orbit(re: &str, im: &str, bits: u32, iters: u32) -> Vec<CFe> {
         let l = limbs_for_bits(bits);
-        compute(&Fixed::from_decimal(re, l).unwrap(), &Fixed::from_decimal(im, l).unwrap(), iters, &|| false)
+        compute(&Fixed::from_decimal(re, l).unwrap(), &Fixed::from_decimal(im, l).unwrap(), iters, &|_| false)
             .unwrap()
             .z
     }

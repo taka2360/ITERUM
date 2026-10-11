@@ -6,9 +6,9 @@
 // view, so motion stays smooth while computation catches up.
 //
 // Colour: the continuous iteration count is mapped logarithmically (bands
-// widen gently towards the set instead of crowding into moiré), filaments
-// near the set catch a soft light, and where bands become finer than a pixel
-// the colour settles to the palette's mean rather than aliasing.
+// widen gently towards the set instead of crowding into moiré) and filaments
+// near the set catch a soft light. Colouring never depends on how far the
+// computation has progressed, so the image keeps its colours when it finishes.
 
 struct DisplayParams {
   size: vec2<u32>,
@@ -22,7 +22,7 @@ struct DisplayParams {
   s_min: f32,
   glow: f32,
   interior: vec4<f32>,
-  mean: vec4<f32>,        // rgb: palette mean; w: band scale (iterations)
+  mean: vec4<f32>,        // w: band scale (iterations); rgb unused
   interior_glow: f32,
   _p0: f32, _p1: f32, _p2: f32,
 }
@@ -45,8 +45,11 @@ struct PixelState {
 
 const NONE: f32 = -3.0;
 
+// The fastest escapes start a little into the palette, not at its darkest stop.
+const BAND_LIFT: f32 = 0.16;
+
 fn band(s: f32) -> f32 {
-  return D.pal_density * log2(1.0 + max(s - D.s_min, 0.0) / D.mean.w) + D.pal_offset;
+  return D.pal_density * log2(1.0 + max(s - D.s_min, 0.0) / D.mean.w) + D.pal_offset + BAND_LIFT;
 }
 
 fn pal(t: f32) -> vec3<f32> {
@@ -79,31 +82,6 @@ fn current(idx: u32) -> vec2<f32> {
   return vec2<f32>(NONE, 0.0);
 }
 
-// First available value of a pixel (sample 0 once done), for band density.
-fn primary(p: vec2<u32>) -> vec2<f32> {
-  let q = min(p, D.size - vec2<u32>(1u));
-  let idx = q.y * D.size.x + q.x;
-  if (D.samples_done > 0u) { return samples[idx]; }
-  return current(idx);
-}
-
-// How much of the palette one pixel spans; above ~0.4 bands alias.
-fn band_step(p: vec2<u32>, v: vec2<f32>) -> f32 {
-  if (v.x < 0.0) { return 0.0; }
-  let t = band(v.x);
-  let a = primary(p + vec2<u32>(1u, 0u));
-  let b = primary(p + vec2<u32>(0u, 1u));
-  var g = 0.0;
-  if (a.x >= 0.0) { g = max(g, abs(band(a.x) - t)); }
-  if (b.x >= 0.0) { g = max(g, abs(band(b.x) - t)); }
-  return g;
-}
-
-fn settle(c: vec3<f32>, p: vec2<u32>, v: vec2<f32>) -> vec3<f32> {
-  let f = smoothstep(0.18, 0.7, band_step(p, v));
-  return mix(c, D.mean.rgb, f * 0.85);
-}
-
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
   let p = vec2<u32>(in.pos.xy);
@@ -113,19 +91,20 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
   var acc = vec3<f32>(0.0);
   var count = 0.0;
-  for (var k = 0u; k < D.samples_done; k++) {
-    acc += shade(samples[k * plane + idx]);
-    count += 1.0;
-  }
+  // Written out rather than looped. A loop over samples[k * plane + idx]
+  // produced wrong (darker) values for k > 0 on the D3D12 backend, although the
+  // buffer contents were correct; the unrolled form reads them reliably.
+  // Keep in step with MAX_SAMPLES in engine.ts.
+  if (D.samples_done > 0u) { acc += shade(samples[idx]); count += 1.0; }
+  if (D.samples_done > 1u) { acc += shade(samples[plane + idx]); count += 1.0; }
+  if (D.samples_done > 2u) { acc += shade(samples[2u * plane + idx]); count += 1.0; }
+  if (D.samples_done > 3u) { acc += shade(samples[3u * plane + idx]); count += 1.0; }
   let cur = current(idx);
   if (cur.x > NONE) {
     acc += shade(cur);
     count += 1.0;
   }
-  if (count > 0.0) {
-    let first = primary(p);
-    return vec4<f32>(settle(acc / count, p, first), 1.0);
-  }
+  if (count > 0.0) { return vec4<f32>(acc / count, 1.0); }
 
   // Not reached yet: borrow from the progressive parents of this job.
   let p1 = p & vec2<u32>(~1u);

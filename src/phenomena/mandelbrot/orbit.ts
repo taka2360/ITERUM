@@ -70,8 +70,20 @@ function upload(device: GPUDevice, data: Uint8Array<ArrayBuffer>, label: string)
   return buffer;
 }
 
+export interface OrbitProgress {
+  id: number;
+  phase: "orbit" | "bla" | "encode" | "idle";
+  iterations: number;
+  maxIter: number;
+  bits: number;
+  elapsedMs: number;
+}
+
 export class OrbitManager {
   current?: OrbitInfo;
+  /** Live progress of the pending computation (polled from Rust). */
+  progress?: OrbitProgress;
+  private poller = 0;
   pending?: { id: number; bits: number; ref: DeepPoint; started: number; kind: "orbit" | "bla" };
   lastError?: string;
   private nextId = 1;
@@ -94,6 +106,8 @@ export class OrbitManager {
       maxIter,
       dcMaxLog2,
     };
+    this.progress = { id, phase: "orbit", iterations: 0, maxIter, bits, elapsedMs: 0 };
+    this.startPolling();
     invoke<ArrayBuffer>("reference_orbit", { req })
       .then((buf) => {
         if (this.pending?.id !== id) return;
@@ -107,6 +121,21 @@ export class OrbitManager {
           this.lastError = String(e);
         }
       });
+  }
+
+  private startPolling(): void {
+    clearInterval(this.poller);
+    this.poller = window.setInterval(() => {
+      if (!this.pending) {
+        clearInterval(this.poller);
+        return;
+      }
+      invoke<OrbitProgress>("orbit_progress")
+        .then((p) => {
+          if (this.pending && p.id === this.pending.id) this.progress = p;
+        })
+        .catch(() => {});
+    }, 200);
   }
 
   /** Rebuilds the BLA table of the current orbit for a new |δc| bound. */
