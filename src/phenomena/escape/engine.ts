@@ -104,6 +104,8 @@ export interface EscapeStats {
 }
 
 const COUNTER_BYTES = 52;
+// Largest per-pixel budget of a full-grid pass (list mode allows more).
+const FULL_BUDGET_MAX = 1 << 16;
 const PARAM_BYTES = 96;
 const DISPLAY_BYTES = 96;
 const STATE_BYTES = 48;
@@ -181,8 +183,15 @@ export class EscapeEngine {
    * this fraction of the pixels is still running; 0 disables it.
    */
   compactBelow = 0.25;
-  /** Target GPU milliseconds per frame for iteration. */
-  targetMs = 9;
+  /**
+   * GPU time per frame for iteration, as a share of the measured frame
+   * interval: more while the view is still (only the image refines), less
+   * while it moves, and never above movingMaxMs then.
+   */
+  stillShare = 0.72;
+  movingShare = 0.55;
+  movingMaxMs = 9;
+  private frameMsAvg = 16.7;
   /** density: palette cycles per doubling of (iterations − sMin)/bandScale. */
   look = { offset: 0, density: 0.32, glow: 0.6, sMin: 0, bandScale: 6, interiorGlow: 0.3 };
 
@@ -337,7 +346,7 @@ export class EscapeEngine {
     this.samplesDone = 0;
     this.converged = false;
     this.framesSinceJob = 0;
-    this.listMode = false;
+    this.leaveListMode();
     this.resetAgg();
   }
 
@@ -543,11 +552,21 @@ export class EscapeEngine {
   }
 
   private adaptBudget(frame: FrameContext): void {
+    if (frame.dt > 0) this.frameMsAvg += (Math.min(frame.dt * 1000, 50) - this.frameMsAvg) * 0.1;
     const ms = frame.timer.passMs.get("escape");
     if (ms === undefined || this.converged) return;
+    const still = performance.now() - this.prog.viewStart > 300;
+    const target = still ? this.frameMsAvg * this.stillShare : Math.min(this.movingMaxMs, this.frameMsAvg * this.movingShare);
     // Multiplicative controller towards the target; clamp per-frame change.
-    const ratio = Math.max(0.5, Math.min(1.5, this.targetMs / Math.max(ms, 0.05)));
-    this.budget = Math.max(32, Math.min(1 << 16, this.budget * ratio));
+    // Few pixels remain in list mode, so each may take a much larger share.
+    const ratio = Math.max(0.5, Math.min(1.5, target / Math.max(ms, 0.05)));
+    this.budget = Math.max(32, Math.min(this.listMode ? 1 << 22 : FULL_BUDGET_MAX, this.budget * ratio));
+  }
+
+  /** Back to full-grid passes: never start those with a list-mode budget. */
+  private leaveListMode(): void {
+    this.listMode = false;
+    this.budget = Math.min(this.budget, FULL_BUDGET_MAX);
   }
 
   private scheduleReadback(enc: GPUCommandEncoder): void {
@@ -628,7 +647,7 @@ export class EscapeEngine {
     this.sample = this.samplesDone;
     this.job++;
     this.framesSinceJob = 0;
-    this.listMode = false;
+    this.leaveListMode();
     this.resetAgg();
   }
 
@@ -644,8 +663,10 @@ export class EscapeEngine {
     // pixels at the old limit are counted again when they stop or escape.
     // Cycling pixels stay interior (they would stop at every limit).
     this.agg.interior = this.agg.cycling;
-    // Pixels at the old limit are not in the list: rebuild it.
+    // Pixels at the old limit are not in the list: rebuild it. Many may
+    // rejoin at once, so start again from a full-grid budget.
     if (this.listMode) this.listBuild = true;
+    this.budget = Math.min(this.budget, FULL_BUDGET_MAX);
     this.agg.late = 0;
     this.agg.unfinished = -1;
   }
