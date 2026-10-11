@@ -140,6 +140,10 @@ struct Counters {
   agg_interior: u32,
   agg_cycling: u32,
   agg_proven: u32,
+  // The totals the latest raise was decided on (diagnostics).
+  raise_escaped: u32,
+  raise_late: u32,
+  raise_paused: u32,
 }
 
 var<workgroup> wg_iterations: atomic<u32>;
@@ -1007,6 +1011,9 @@ fn decide_limit() {
   if (!more) { return; }
   counters.max_iter = min(P.max_iter_cap, cur * 2u);
   counters.raises += 1u;
+  counters.raise_escaped = counters.agg_escaped;
+  counters.raise_late = counters.agg_late;
+  counters.raise_paused = counters.agg_interior - counters.agg_cycling - counters.agg_proven;
   counters.raised_now = 1u;
   counters.agg_interior = counters.agg_cycling + counters.agg_proven;
   counters.agg_late = 0u;

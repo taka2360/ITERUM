@@ -13,6 +13,10 @@
 // per-pixel status and iteration count are saved), then once at the timing
 // resolution as warm-up, then ITERUM_RUNS times (default 5) for timing.
 // Experiments: ITERUM_CAP caps the iteration limit of every view,
+// ITERUM_DUMP_LIMIT=L instead renders each (perturbation) view once at the
+// timing resolution, one sample without jitter, with the limit fixed at L and
+// no interior proofs, and writes <view>-dump-{packet.bin, view.txt, state.bin,
+// webgpu.txt} for the CUDA benchmark (src-tauri/examples/cuda).
 // ITERUM_PROVEN=0 disables the proven-interior tests (ITERUM_PATCHES=0 only
 // the component proofs), ITERUM_TRAP sets the fewest shading steps of proven
 // pixels.
@@ -103,6 +107,7 @@ export interface GoldenResult {
   timedOut?: boolean;
   /** Time to obtain the component proofs (perturbation views). */
   patchMs?: number;
+  raises?: { from: number; to: number; escaped: number; late: number; paused: number }[];
 }
 
 async function orbitFor(orbits: OrbitManager, cam: DeepCamera, log2s: number, w: number, h: number, grow = false): Promise<number> {
@@ -110,7 +115,8 @@ async function orbitFor(orbits: OrbitManager, cam: DeepCamera, log2s: number, w:
   const t0 = performance.now();
   // Grow: the app's first request (limit 800: 4096 iterations, bits for that limit).
   const bits = grow ? Math.ceil(-log2s) + 32 + Math.ceil(Math.log2(800)) + 32 : Math.ceil(-log2s) + 64 + 32;
-  orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, bits, grow ? 4096 : ORBIT_ITER, log2s + Math.log2(Math.hypot(w, h) * 2));
+  const length = dumpLimit ? dumpLimit + 1 : grow ? 4096 : ORBIT_ITER;
+  orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, bits, length, log2s + Math.log2(Math.hypot(w, h) * 2));
   while (!orbits.current && performance.now() - t0 < 300000) await seconds(0.02);
   if (!orbits.current) throw new Error(`orbit failed: ${orbits.lastError ?? "timeout"}`);
   return performance.now() - t0;
@@ -122,6 +128,7 @@ const sum = (os: OrbitInfo[], f: (o: OrbitInfo) => number) => +os.reduce((t, o) 
 /** Experiment settings from the environment (see the header). */
 let experiment: (e: EscapeEngine) => void = () => {};
 let usePatches = true;
+let dumpLimit = 0;
 
 export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManager, w = W, h = H, configure?: (e: EscapeEngine) => void): Promise<{ engine: EscapeEngine; result: GoldenResult }> {
   let view: EscapeView;
@@ -133,7 +140,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
     const d = gv.deep!;
     const log2s = d.widthLog2 - Math.log2(w);
     const cam = new DeepCamera(d.re, d.im, log2s);
-    orbitMs = await orbitFor(orbits, cam, log2s, w, h, gv.grow);
+    orbitMs = await orbitFor(orbits, cam, log2s, w, h, gv.grow && !dumpLimit);
     const o = orbits.current!;
     const mode = log2s > -100 && o.minLog2Abs > -100 && o.dcMaxLog2 > -120 ? MODE_PERTURB : MODE_DEEP;
     view = { mode, spacing: feFromLog2(log2s), center: [0, 0], cmr: [0, 0], juliaC: [0, 0], orbit: o, interiorRef: orbitReference(o) };
@@ -142,13 +149,18 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
   engine.init(app.gpu);
   engine.minIter = engine.maxIter = 800;
   if (view.orbit && !gv.grow && !orbits.current!.periodic && !orbits.current!.escaped) engine.maxIterCap = ORBIT_ITER;
-  if (gv.grow) engine.orbitExtends = true;
+  if (gv.grow && !dumpLimit) engine.orbitExtends = true;
   experiment(engine);
+  if (dumpLimit) {
+    engine.minIter = engine.maxIter = engine.maxIterCap = dumpLimit;
+    engine.sampleTarget = 1;
+    engine.provenInterior = false;
+  }
   configure?.(engine);
   const installed: OrbitInfo[] = view.orbit ? [orbits.current!] : [];
   // Component proofs, as the app asks for them (here before the first frame).
   let patchMs: number | undefined;
-  if (view.mode === MODE_PERTURB && usePatches) {
+  if (view.mode === MODE_PERTURB && usePatches && !dumpLimit) {
     const t = performance.now();
     engine.setView(view, null);
     engine.setPatches(await requestPatches(orbits.current!, view, w, h));
@@ -219,6 +231,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
         : undefined,
       timedOut: timedOut || undefined,
       patchMs: patchMs !== undefined ? +patchMs.toFixed(1) : undefined,
+      raises: engine.raiseLog,
     },
   };
 }
@@ -240,6 +253,24 @@ async function statusAndCount(engine: EscapeEngine): Promise<Uint8Array<ArrayBuf
   return new Uint8Array(out.buffer);
 }
 
+/** ITERUM_DUMP_LIMIT: inputs and WebGPU results for the CUDA benchmark. */
+async function dumpView(app: App, gv: GoldenView, orbits: OrbitManager, dir: string): Promise<void> {
+  const [w, h] = TIMING;
+  const { engine, result } = await renderGolden(app, gv, orbits, w, h);
+  const out = `${dir}/${fileName(gv.name)}-dump`; // file prefix
+  const o = orbits.current!;
+  const log2s = gv.deep!.widthLog2 - Math.log2(w);
+  const sp = feFromLog2(log2s);
+  if (MODE_NAMES.indexOf(result.mode) === MODE_PERTURB && orbits.lastPacket) {
+    await saveFile(`${out}-packet.bin`, new Uint8Array(orbits.lastPacket));
+    await saveFile(`${out}-view.txt`, new TextEncoder().encode(`${w} ${h} ${sp.m} ${sp.e} 0 0 ${dumpLimit}\n`));
+    await saveFile(`${out}-state.bin`, await statusAndCount(engine));
+    await saveFile(`${out}-webgpu.txt`, new TextEncoder().encode(`${JSON.stringify({ gpuEscapeMs: result.gpuEscapeMs, steps: result.steps, wallS: result.wallS, frames: result.frames, orbitLen: o.len })}\n`));
+  }
+  diag(`DUMP ${JSON.stringify(result)}`);
+  engine.dispose();
+}
+
 export async function runGolden(app: App): Promise<void> {
   await seconds(1);
   const dir = `${await outDir()}`;
@@ -248,6 +279,7 @@ export async function runGolden(app: App): Promise<void> {
   const results: (GoldenResult & { timing?: GoldenResult[] })[] = [];
   const timingOff = (await envVar("ITERUM_TIMING")) === "0";
   const runs = timingOff ? 0 : Number((await envVar("ITERUM_RUNS")) ?? TIMING_RUNS);
+  dumpLimit = Number((await envVar("ITERUM_DUMP_LIMIT")) ?? 0);
   const cap = await envVar("ITERUM_CAP");
   const proven = (await envVar("ITERUM_PROVEN")) !== "0";
   const trap = await envVar("ITERUM_TRAP");
@@ -258,6 +290,10 @@ export async function runGolden(app: App): Promise<void> {
   };
   usePatches = proven && (await envVar("ITERUM_PATCHES")) !== "0";
   for (const gv of GOLDEN_VIEWS.filter((v) => !only || only.split(",").includes(v.name))) {
+    if (dumpLimit) {
+      if (gv.deep) await dumpView(app, gv, orbits, dir).catch((e) => diag(`DUMP ERROR ${e?.stack ?? e}`));
+      continue;
+    }
     const { engine, result } = await renderGolden(app, gv, orbits);
     const samples = await engine.readSamples();
     await saveFile(`${dir}/${fileName(gv.name)}.bin`, new Uint8Array(samples.buffer));

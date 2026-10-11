@@ -168,6 +168,8 @@ export class OrbitManager {
   private poller = 0;
   pending?: { id: number; bits: number; ref: DeepPoint; started: number; kind: "orbit" | "bla"; extend?: OrbitInfo };
   lastError?: string;
+  /** The latest full packet received (benchmarks dump it). */
+  lastPacket?: ArrayBuffer;
   private nextId = 1;
 
   constructor(private device: GPUDevice) {}
@@ -208,6 +210,7 @@ export class OrbitManager {
       .then((buf) => {
         if (this.pending?.id !== id) return;
         const p = decodePacket(buf);
+        if (!p.delta) this.lastPacket = buf;
         const ext = this.pending.extend;
         const continues = ext && this.current === ext && p.len >= ext.len && p.bits === ext.bits && p.dcMaxLog2 === ext.dcMaxLog2 ? ext.id : undefined;
         if (p.delta && (continues === undefined || p.delta.baseId !== ext!.rustId || p.delta.baseLen !== ext!.len)) {

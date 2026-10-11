@@ -119,7 +119,8 @@ const C_RAISES = 18;
 const C_RAISED_NOW = 19;
 const C_FRAME_MAX_ITER = 20;
 const C_AGG = 21; // escaped, late, interior, cycling, proven
-const COUNTER_BYTES = 26 * 4;
+const C_RAISE = 26; // escaped, late, paused at the latest raise
+const COUNTER_BYTES = 29 * 4;
 // Coefficients of the closed-form interior tests (interior.ts).
 const TERM_BYTES = 21 * 16;
 // Component proofs (component.rs): one record per tile of an 8 × 8 grid.
@@ -245,6 +246,8 @@ export class EscapeEngine {
   iterationsTotal = 0;
   /** Times the iteration limit was raised (benchmarks). */
   restarts = 0;
+  /** The limit raises of sample 0 since init and what they were decided on (benchmarks). */
+  raiseLog: { from: number; to: number; escaped: number; late: number; paused: number }[] = [];
   /** Loop steps actually executed since init (a BLA span counts once); benchmarks. */
   stepsTotal = 0;
   /** Frames that recorded iteration work since init. */
@@ -799,6 +802,7 @@ export class EscapeEngine {
    * returns to a full-grid one (the GPU caps it until this is seen).
    */
   private noteRaises(c: Uint32Array): void {
+    this.raiseLog.push({ from: this.maxIter, to: c[C_MAX_ITER], escaped: c[C_RAISE], late: c[C_RAISE + 1], paused: c[C_RAISE + 2] });
     this.restarts += c[C_RAISES] - this.raisesSeen;
     this.raisesSeen = c[C_RAISES];
     this.maxIter = c[C_MAX_ITER];
