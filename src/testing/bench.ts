@@ -92,6 +92,9 @@ async function runOnce(app: App, sc: Scenario): Promise<RunStats> {
   sc.setup(app);
   const t0 = performance.now();
   let convergeS: number | undefined;
+  // The previous view's status lingers until the new view renders: only a
+  // "converged" after a "refining" frame counts.
+  let refined = false;
   const raf: number[] = [];
   const gpu: number[] = [];
   const passes = new Map<string, number[]>();
@@ -105,7 +108,8 @@ async function runOnce(app: App, sc: Scenario): Promise<RunStats> {
     const t = (now - t0) / 1000;
     sc.motion?.(app, t, (now - last) / 1000);
     last = now;
-    if (convergeS === undefined && sc.converge && app.lastStatus === "converged") convergeS = t;
+    if (app.lastStatus === "refining") refined = true;
+    if (convergeS === undefined && sc.converge && refined && app.lastStatus === "converged") convergeS = t;
     if (!measuring) return;
     raf.push(info.rafMs);
     // Only count fresh GPU measurements (they arrive a few frames late).
@@ -235,7 +239,8 @@ export async function runBench(app: App): Promise<void> {
   };
   const lines: string[] = [];
   const only = await envVar("ITERUM_BENCH");
-  for (const sc of only === "deep" ? [] : SCENARIOS) {
+  const list = only === "deep" ? [] : only === "static" ? SCENARIOS.filter((s) => s.converge) : SCENARIOS;
+  for (const sc of list) {
     const runs: RunStats[] = [];
     for (let r = 0; r < RUNS; r++) runs.push(await runOnce(app, sc));
     const agg = (k: keyof RunStats) => {
