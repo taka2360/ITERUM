@@ -12,12 +12,12 @@ const KEYS: [string, string][] = [
   ["ダブルクリック", "その点へ近づく"],
   ["右ドラッグ", "パラメータを動かす（ジュリア集合）"],
   ["V", "Voyage — 自動で深く潜る（マンデルブロ集合）"],
-  ["Space", "動きを止める ／ 再開"],
+  ["Space", "再生 ／ 停止（マンデルブロ集合では Voyage）"],
   ["C", "配色を変える"],
   ["F", "全画面"],
   ["I", "解説"],
   ["H", "表示をすべて隠す"],
-  ["R", "はじめの視点へ"],
+  ["R", "視点を戻す"],
   ["Q", "品質（自動・低・中・高）"],
   ["D", "計測情報"],
 ];
@@ -29,9 +29,16 @@ export class Overlay {
   private toastTimer = 0;
   private selector = $("#selector");
   onSelect: (i: number) => void = () => {};
+  onPlay: () => void = () => {};
+  onReset: () => void = () => {};
+  private controlsKey = "";
 
   constructor() {
-    for (const id of ["#mark", "#caption", "#info", "#notice"]) $(id).classList.add("fades");
+    for (const id of ["#mark", "#caption", "#info", "#notice", "#controls"]) $(id).classList.add("fades");
+    $("#play").addEventListener("click", () => this.onPlay());
+    $("#reset").addEventListener("click", () => this.onReset());
+    // Buttons must not keep keyboard focus (Space would click them again).
+    for (const id of ["#play", "#reset"]) $(id).addEventListener("pointerup", (e) => (e.currentTarget as HTMLElement).blur());
     const dl = $("#help").querySelector("dl")!;
     for (const [k, v] of KEYS) {
       const dt = document.createElement("dt");
@@ -71,6 +78,26 @@ export class Overlay {
     }, 500);
     this.selector.querySelectorAll("button").forEach((b, i) => b.classList.toggle("active", i === index));
     this.wake();
+  }
+
+  /** Play button: pause/play icon for animations, a labelled toggle for Voyage. */
+  setControls(motion: "animation" | "voyage", playing: boolean): void {
+    const key = `${motion}:${playing}`;
+    if (key === this.controlsKey) return;
+    this.controlsKey = key;
+    const b = $("#play");
+    const pause = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect class="solid" x="7" y="6" width="3" height="12" rx="0.6"/><rect class="solid" x="14" y="6" width="3" height="12" rx="0.6"/></svg>';
+    const play = '<svg viewBox="0 0 24 24" aria-hidden="true"><path class="solid" d="M8 5.5v13l10.5-6.5z"/></svg>';
+    if (motion === "voyage") {
+      b.classList.add("wide");
+      b.innerHTML = `${playing ? pause : play}<span class="label">Voyage</span>`;
+      b.title = playing ? "Voyage を止める（Space / V）" : "Voyage — 自動で深く潜る（Space / V）";
+    } else {
+      b.classList.remove("wide");
+      b.innerHTML = playing ? pause : play;
+      b.title = playing ? "停止（Space）" : "再生（Space）";
+    }
+    b.setAttribute("aria-label", b.title);
   }
 
   /** Marks activity; captions return and fade again after a pause. */

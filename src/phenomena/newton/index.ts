@@ -36,6 +36,7 @@ export class Newton implements Phenomenon {
     description:
       "方程式の根を探すニュートン法を、平面のあらゆる点から出発させる。どの根にたどり着くかで塗り分けると、領域の境目には三つ以上の色が無限に入れ子になって接する。根はゆっくりと巡り、境界は絶えず編み直される。",
     hints: ["ドラッグ — 移動", "ホイール — 拡大・縮小", "N — 根の数を変える", "Space — 動きを止める"],
+    motion: "animation",
   };
 
   private device!: GPUDevice;
@@ -100,7 +101,7 @@ export class Newton implements Phenomenon {
   update(input: InputFrame, ctx: { time: number; dt: number; paused: boolean; viewW: number; viewH: number }): void {
     const dt = Math.min(ctx.dt, 0.1);
     if (this.needsHome) {
-      this.camera = new Camera2D(0, 0, Math.log2(3.4 / Math.max(1, Math.min(ctx.viewW, ctx.viewH * 1.5))));
+      this.camera = new Camera2D(0, 0, Math.log2(4.4 / Math.max(1, Math.min(ctx.viewW, ctx.viewH * 1.5))));
       this.needsHome = false;
     }
     const cam = this.camera;

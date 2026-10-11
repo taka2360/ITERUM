@@ -56,14 +56,15 @@ fn sample_at(z0: vec2<f32>) -> vec3<f32> {
       var frac = 0.0;
       if (n > 0u && lp > ld) { frac = clamp((lt - lp) / (ld - lp), 0.0, 1.0); }
       let t = max(f32(n) - 1.0 + frac, 0.0);
-      let hue = f32(hit) / f32(P.roots_n);
-      let base = textureSampleLevel(palette, pal_sampler, vec2<f32>(hue * 0.62 + 0.42 + P.pal_offset, 0.5), 0.0).rgb;
+      // Basin colours come from the luminous middle of the palette, spread evenly.
+      let hue = 0.32 + 0.46 * f32(hit) / max(f32(P.roots_n) - 1.0, 1.0);
+      let base = textureSampleLevel(palette, pal_sampler, vec2<f32>(hue + 0.012 * t + P.pal_offset, 0.5), 0.0).rgb;
       // Points that settle quickly sink into shadow; slow ones, near basin
       // boundaries, carry the colour and a soft light.
-      let g = 1.0 - exp(-0.16 * t);
-      let shade = 0.06 + 0.94 * smoothstep(0.0, 1.0, g);
+      let g = 1.0 - exp(-0.18 * t);
+      let shade = 0.07 + 0.93 * smoothstep(0.0, 1.0, g);
       let col = mix(P.interior.rgb, base, shade);
-      return col + sqrt(base) * P.glow * pow(g, 8.0) * 0.45;
+      return col + sqrt(base) * P.glow * pow(g, 6.0) * 0.5;
     }
     prev = z;
     z -= P.relax * cdiv(vec2<f32>(1.0, 0.0), s);

@@ -28,6 +28,7 @@ export class Julia implements Phenomenon {
     description:
       "マンデルブロ集合と同じ式で、c を固定し出発点 z を動かしたときに逃げない点の集まり。c がマンデルブロ集合の縁をゆっくり巡るにつれ、形はつながった島から塵のような星屑へと姿を変える。",
     hints: ["ドラッグ — 移動", "ホイール — 拡大・縮小", "右ドラッグ — c を動かす", "Space — 変化を止める"],
+    motion: "animation",
   };
 
   private engine: EscapeEngine;
@@ -47,8 +48,9 @@ export class Julia implements Phenomenon {
     this.engine.minIter = 400;
     this.engine.maxIter = 600;
     this.engine.maxIterCap = 1 << 16;
-    this.engine.look.density = 0.16;
+    this.engine.look.density = 0.42;
     this.engine.look.glow = 0.5;
+    this.engine.look.interiorGlow = 0.55;
   }
 
   init(gpu: GpuContext): void {
@@ -58,7 +60,6 @@ export class Julia implements Phenomenon {
 
   reset(): void {
     this.needsHome = true;
-    this.manualOffset = [0, 0];
     this.velocity = [0, 0];
     this.zoomImpulse = 0;
   }
@@ -111,7 +112,9 @@ export class Julia implements Phenomenon {
       this.theta += dt * 0.035;
       this.drift += dt * 0.006;
     }
-    const breath = 1.0 + 0.045 * Math.sin(this.theta * 2.3) - 0.02;
+    // Hover around the boundary, slightly more often just outside it, where
+    // the set breaks into spirals and dust.
+    const breath = 1.012 + 0.03 * Math.sin(this.theta * 2.3);
     const [x, y] = cardioid(this.theta, breath);
     this.c = [x + this.manualOffset[0], y + this.manualOffset[1]];
     const el = document.querySelector(".c-value");

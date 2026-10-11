@@ -43,6 +43,7 @@ export class Mandelbrot implements Phenomenon {
     description:
       "複素数 c ごとに z を二乗して c を足す操作を繰り返し、値が無限大へ逃げない c の集まり。境界はどこまで拡大しても尽きることのない細部を持ち、その奥には自分自身の小さな写しが無数に潜んでいる。",
     hints: ["ドラッグ — 移動", "ホイール — 拡大・縮小", "ダブルクリック — その点へ近づく", "V — Voyage（自動で深く潜る）"],
+    motion: "voyage",
   };
 
   private engine: EscapeEngine;
@@ -113,6 +114,14 @@ export class Mandelbrot implements Phenomenon {
       return;
     }
     this.startVoyage(index ?? Math.floor(Math.random() * VOYAGES.length));
+  }
+
+  playing(): boolean {
+    return this.voyage !== undefined;
+  }
+
+  setPlaying(on: boolean): void {
+    if (on !== this.playing()) this.toggleVoyage();
   }
 
   get voyaging(): boolean {

@@ -16,9 +16,14 @@ fn aces(x: vec3<f32>) -> vec3<f32> {
   let p = vec2<u32>(in.pos.xy);
   let i = (p.y * P.size.x + p.x) * 3u;
   let v = vec3<f32>(f32(accum[i]), f32(accum[i + 1u]), f32(accum[i + 2u])) / 256.0;
-  // Logarithmic exposure keeps both faint wisps and dense cores legible.
-  let e = log2(1.0 + v * P.exposure) * 0.32;
-  let c = aces(e);
-  // The light is accumulated in sRGB-ish values; lift it over the background.
+  // Tone-map luminance only and keep the palette's hue, so dense cores glow in
+  // colour instead of bleaching; logarithmic exposure keeps faint wisps visible.
+  let l = dot(v, vec3<f32>(0.2126, 0.7152, 0.0722));
+  let lt = aces(vec3<f32>(log2(1.0 + l * P.exposure) * 0.3)).x;
+  let hue = v / max(l, 1e-6);
+  var c = hue * lt;
+  // Only the very brightest cores drift towards white.
+  c = mix(c, vec3<f32>(lt), smoothstep(0.75, 1.0, lt) * 0.45);
+  c = min(c, vec3<f32>(1.0));
   return vec4<f32>(P.background.rgb + c * (1.0 - P.background.rgb), 1.0);
 }

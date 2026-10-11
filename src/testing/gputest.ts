@@ -352,6 +352,44 @@ async function testDeviceLoss(app: App): Promise<void> {
   report("device-loss", ok, `generation ${before} → ${app.deviceGeneration}; mean luminance after recovery: ${lumas.join(", ")}`);
 }
 
+// ---- controls ----------------------------------------------------------------
+
+async function testControls(app: App): Promise<void> {
+  const click = (id: string) => (document.getElementById(id) as HTMLButtonElement).click();
+  const notes: string[] = [];
+  let ok = true;
+  // Animated phenomena: play button pauses and resumes their motion.
+  for (const i of [1, 2, 3]) {
+    app.select(i);
+    await seconds(0.3);
+    click("play");
+    const paused = app.paused;
+    click("play");
+    const resumed = !app.paused;
+    if (!paused || !resumed) ok = false;
+    notes.push(`${app.phenomena[i].meta.id} pause ${paused} resume ${resumed}`);
+  }
+  // Mandelbrot: play button starts and stops Voyage.
+  app.select(0);
+  await seconds(0.3);
+  const m = app.phenomena[0] as import("../phenomena/mandelbrot").Mandelbrot;
+  click("play");
+  const started = m.playing();
+  click("play");
+  const stopped = !m.playing();
+  if (!started || !stopped) ok = false;
+  notes.push(`voyage start ${started} stop ${stopped}`);
+  // Reset: a deep view returns to the overview.
+  m.setView("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", -120);
+  await seconds(0.5);
+  click("reset");
+  await seconds(1.5);
+  const back = m.cameraState.log2Scale > -12;
+  if (!back) ok = false;
+  notes.push(`reset log2Scale ${m.cameraState.log2Scale.toFixed(1)}`);
+  report("controls", ok, notes.join("; "));
+}
+
 export async function runGpuTests(app: App): Promise<void> {
   await seconds(1);
   const steps: [string, () => Promise<void>][] = [];
@@ -366,6 +404,7 @@ export async function runGpuTests(app: App): Promise<void> {
   steps.push(["deep-1e-98-wide", () => deepView(app, v("Elephant Valley").re, v("Elephant Valley").im, -v("Elephant Valley").depthLog2 + 6, "auto", 50000, "escape-floatexp-1e-98-surroundings", orbits)]);
   steps.push(["deep-1e-300", () => deepView(app, v("Seahorse Abyss").re, v("Seahorse Abyss").im, -v("Seahorse Abyss").depthLog2 + 2, "auto", 50000, "escape-floatexp-1e-300", orbits)]);
   steps.push(["modes", () => testModesAgree(app, orbits)]);
+  steps.push(["controls", () => testControls(app)]);
   steps.push(["device-loss", () => testDeviceLoss(app)]);
   for (const [name, fn] of steps) {
     try {

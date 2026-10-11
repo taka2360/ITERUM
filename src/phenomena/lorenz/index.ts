@@ -34,10 +34,11 @@ export class Lorenz implements Phenomenon {
     description:
       "大気の対流を極端に単純化した三つの方程式。わずかに異なる位置から出発した点はたちまち別々の道を進むのに、全体はいつも同じ蝶の翅のような形の上に留まり続ける。ここでは数十万の粒子がその流れに乗って光の跡を残している。",
     hints: ["ドラッグ — 回転", "ホイール — 近づく・離れる", "Space — 流れを止める"],
+    motion: "animation",
   };
 
   settings: LorenzSettings = { ...LORENZ_DEFAULTS };
-  exposure = 0.09;
+  exposure = 0.14;
   private device!: GPUDevice;
   private sim!: GPUComputePipeline;
   private warm!: GPUComputePipeline;
@@ -100,7 +101,6 @@ export class Lorenz implements Phenomenon {
 
   reset(): void {
     this.camera = Lorenz.homeCamera();
-    this.seeded = false;
   }
 
   /**

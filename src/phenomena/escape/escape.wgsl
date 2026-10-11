@@ -47,7 +47,7 @@ struct PixelState {
   job: u32,
   status: u32,                 // 0 running, 1 escaped, 2 interior (max_iter), 3 numeric anomaly
   rebases: u32,
-  _pad: u32,
+  trap: f32,                   // smallest |z|² seen (interior shading)
 }
 
 struct OrbitPt { re: f32, im: f32, e: i32, _pad: u32 }
@@ -119,7 +119,8 @@ fn finish_interior(s: ptr<function, PixelState>, idx: u32) {
   (*s).dr = -1.0;
   (*s).di = 0.0;
   (*s).status = 2u;
-  samples[P.sample * P.size.x * P.size.y + idx] = vec2<f32>(-1.0, 0.0);
+  samples[P.sample * P.size.x * P.size.y + idx] = vec2<f32>(-1.0, sqrt((*s).trap));
+  (*s).di = sqrt((*s).trap);
   atomicAdd(&counters.interior, 1u);
 }
 
@@ -138,6 +139,7 @@ fn init_state(pix: vec2<u32>) -> PixelState {
   s.n = 0u;
   s.m = 0u;
   s.rebases = 0u;
+  s.trap = 1e30;
   s.de = 0;
   s.ge = 0;
   s.dr = 0.0; s.di = 0.0; s.gr = 0.0; s.gi = 0.0;
@@ -165,6 +167,7 @@ fn iterate_direct(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
     g = 2.0 * cmul(z, g) + vec2<f32>(gc, 0.0);
     z = cmul(z, z) + c;
     n++;
+    (*s).trap = min((*s).trap, dot(z, z));
     if (dot(z, z) > BAIL2) {
       (*s).n = n;
       var lg = 0.5 * log2(dot(g, g));
@@ -227,6 +230,7 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
     }
     let z = orbit_f(m) + d;
     let r2 = dot(z, z);
+    (*s).trap = min((*s).trap, r2);
     if (r2 > BAIL2) {
       (*s).n = n;
       var lg = 0.5 * log2(dot(g, g));
@@ -300,8 +304,10 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       n++;
     }
     let z = cf_add(orbit_cf(m), d);
+    if (z.e < -40) { (*s).trap = 0.0; }
     if (z.e >= -40) {
       let zf = cf_to_vec2(z);
+      (*s).trap = min((*s).trap, dot(zf, zf));
       if (dot(zf, zf) > BAIL2) {
         (*s).n = n;
         let lg = log2(length(g.v)) + f32(g.e);

@@ -68,7 +68,7 @@ export interface EscapeStats {
 
 const COUNTER_BYTES = 48;
 const PARAM_BYTES = 80;
-const DISPLAY_BYTES = 64;
+const DISPLAY_BYTES = 96;
 const STATE_BYTES = 48;
 const MAX_SAMPLES = 4;
 
@@ -120,7 +120,8 @@ export class EscapeEngine {
   sampleTarget = MAX_SAMPLES;
   /** Target GPU milliseconds per frame for iteration. */
   targetMs = 9;
-  look = { offset: 0, density: 0.09, glow: 0.6, sMin: 0 };
+  /** density: palette cycles per doubling of (iterations − sMin)/bandScale. */
+  look = { offset: 0, density: 0.32, glow: 0.6, sMin: 0, bandScale: 6, interiorGlow: 0.3 };
 
   private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1 };
   /** Aggregated statistics of the most recently completed sample. */
@@ -345,7 +346,8 @@ export class EscapeEngine {
     }
 
     // Display.
-    const pal = this.palette().palette;
+    const palTex = this.palette();
+    const pal = palTex.palette;
     const interior = hexToRgb(pal.interior);
     const dbuf = new ArrayBuffer(DISPLAY_BYTES);
     const du = new Uint32Array(dbuf);
@@ -354,6 +356,8 @@ export class EscapeEngine {
     df[4] = this.hist.offset[0]; df[5] = this.hist.offset[1]; df[6] = this.hist.scale; du[7] = this.histValid ? 1 : 0;
     df[8] = this.look.offset; df[9] = this.look.density; df[10] = this.look.sMin; df[11] = this.look.glow;
     df[12] = interior[0]; df[13] = interior[1]; df[14] = interior[2]; df[15] = 1;
+    df[16] = palTex.mean[0]; df[17] = palTex.mean[1]; df[18] = palTex.mean[2]; df[19] = this.look.bandScale;
+    df[20] = this.look.interiorGlow;
     device.queue.writeBuffer(this.displayParams, 0, dbuf);
     this.outIndex = 1 - this.outIndex;
     const target = this.outputs[this.outIndex];

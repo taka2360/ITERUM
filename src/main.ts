@@ -28,10 +28,12 @@ export class App {
   index = 0;
   private outgoing?: { texture: GPUTexture };
   private transition = 1;
+  private transitionS = TRANSITION_S;
   private lastOutput?: GPUTexture;
   private time = 0;
   private last = performance.now();
-  paused = false;
+  /** Pause state per phenomenon (only those whose motion is "animation"). */
+  private pausedBy: boolean[] = [];
   private generation = 0;
   private recovering = false;
   private fadeIn = 0;
@@ -48,6 +50,8 @@ export class App {
     this.input.onActivity = () => this.overlay.wake();
     this.overlay.setPhenomena(this.phenomena.map((p) => p.meta));
     this.overlay.onSelect = (i) => this.select(i);
+    this.overlay.onPlay = () => this.togglePlay();
+    this.overlay.onReset = () => this.resetView();
     window.addEventListener("keydown", (e) => this.onKey(e));
     new ResizeObserver(() => this.resize()).observe(canvas);
     this.resize();
@@ -57,6 +61,7 @@ export class App {
     if (!(await this.initGpu())) return false;
     this.overlay.show(this.phenomena[0].meta, 0);
     this.phenomena[0].setActive?.(true);
+    this.syncControls();
     requestAnimationFrame((t) => this.frame(t));
     return true;
   }
@@ -108,6 +113,38 @@ export class App {
     return this.generation;
   }
 
+  get paused(): boolean {
+    return this.pausedBy[this.index] ?? false;
+  }
+
+  /** Play/stop for the active phenomenon: its animation, or its voyage. */
+  togglePlay(): void {
+    const p = this.active;
+    if (p.meta.motion === "voyage") {
+      p.setPlaying?.(!p.playing?.());
+      this.overlay.toast(p.playing?.() ? "Voyage" : "Voyage を止めました");
+    } else {
+      this.pausedBy[this.index] = !this.paused;
+      this.overlay.toast(this.paused ? "停止" : "再生");
+    }
+    this.syncControls();
+  }
+
+  /** Returns the view to its start, dissolving from the current image. */
+  resetView(): void {
+    if (this.lastOutput) this.outgoing = { texture: this.lastOutput };
+    this.transition = 0;
+    this.transitionS = 0.9;
+    this.active.reset();
+    this.syncControls();
+  }
+
+  private syncControls(): void {
+    const p = this.active;
+    const playing = p.meta.motion === "voyage" ? !!p.playing?.() : !this.paused;
+    this.overlay.setControls(p.meta.motion, playing);
+  }
+
   get active(): Phenomenon {
     return this.phenomena[this.index];
   }
@@ -131,7 +168,9 @@ export class App {
     this.index = i;
     this.active.setActive?.(true);
     this.transition = 0;
+    this.transitionS = TRANSITION_S;
     this.overlay.show(this.active.meta, i);
+    this.syncControls();
   }
 
   private onKey(e: KeyboardEvent): void {
@@ -143,8 +182,8 @@ export class App {
       case "ArrowLeft": this.select(this.index - 1); break;
       case "f": case "F": case "F11": e.preventDefault(); toggleFullscreen(); break;
       case "Escape": if (document.fullscreenElement) document.exitFullscreen(); break;
-      case " ": e.preventDefault(); this.paused = !this.paused; this.overlay.toast(this.paused ? "一時停止" : "再開"); break;
-      case "r": case "R": this.active.reset(); break;
+      case " ": e.preventDefault(); this.togglePlay(); break;
+      case "r": case "R": this.resetView(); break;
       case "c": case "C": this.palette.set(this.palette.index + 1); this.overlay.toast(`配色：${PALETTES[this.palette.index].name}`); break;
       case "h": case "H": this.overlay.toggleHidden(); break;
       case "i": case "I": this.overlay.toggle("info"); break;
@@ -192,7 +231,7 @@ export class App {
     });
     this.lastOutput = r.output;
     if (this.transition < 1) {
-      this.transition = Math.min(1, this.transition + dt / TRANSITION_S);
+      this.transition = Math.min(1, this.transition + dt / this.transitionS);
       if (this.transition >= 1) this.outgoing = undefined;
     }
     const target = this.gpu.context.getCurrentTexture();
@@ -215,6 +254,7 @@ export class App {
     }
     this.governor.sample(now, { rafMs, gpuMs: fixedGpu, cpuMs });
     this.overlay.setNotice(active.notice?.());
+    this.syncControls();
     if (this.overlay.isOpen("debug")) this.updateDebug(rafMs, cpuMs, width, height);
     this.onFrame?.({ now, rafMs, cpuMs });
   }

@@ -18,6 +18,11 @@ export interface PhenomenonMeta {
   description: string;
   /** Short interaction hints shown in the help overlay. */
   hints: string[];
+  /**
+   * What the play control does: "animation" pauses/resumes the phenomenon's
+   * own motion; "voyage" starts/stops an automatic journey (setPlaying).
+   */
+  motion: "animation" | "voyage";
 }
 
 export interface FrameContext {
@@ -52,7 +57,11 @@ export interface Phenomenon {
   debug?(): Record<string, string>;
   /** Short status line shown subtly (e.g. "computing reference"). */
   notice?(): string | undefined;
+  /** Returns the view (camera) to its starting point; the simulation keeps running. */
   reset(): void;
+  /** For motion "voyage": whether the journey is running, and control of it. */
+  playing?(): boolean;
+  setPlaying?(on: boolean): void;
   /** Called when the phenomenon becomes visible or hidden. */
   setActive?(active: boolean): void;
   dispose(): void;

@@ -122,11 +122,20 @@ export function paletteLut(p: Palette): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+/** Average colour of a palette (sRGB), used where bands are finer than a pixel. */
+export function paletteMean(p: Palette): [number, number, number] {
+  const lut = paletteLut(p);
+  const m = [0, 0, 0];
+  for (let i = 0; i < LUT_SIZE; i++) for (let c = 0; c < 3; c++) m[c] += lut[i * 4 + c] / 255;
+  return [m[0] / LUT_SIZE, m[1] / LUT_SIZE, m[2] / LUT_SIZE];
+}
+
 /** GPU texture + sampler for the active palette, shared by all phenomena. */
 export class PaletteTexture {
   readonly texture: GPUTexture;
   readonly sampler: GPUSampler;
   index = 0;
+  mean: [number, number, number] = [0, 0, 0];
 
   constructor(private device: GPUDevice) {
     this.texture = device.createTexture({
@@ -149,6 +158,7 @@ export class PaletteTexture {
 
   set(i: number): void {
     this.index = ((i % PALETTES.length) + PALETTES.length) % PALETTES.length;
+    this.mean = paletteMean(this.palette);
     this.device.queue.writeTexture({ texture: this.texture }, paletteLut(this.palette), { bytesPerRow: LUT_SIZE * 4 }, [LUT_SIZE, 1]);
   }
 }
