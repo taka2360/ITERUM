@@ -192,6 +192,26 @@ mod tests {
     }
 
     #[test]
+    fn radius_never_grows_with_the_level_at_a_start() {
+        // escape.wgsl skips every longer span once the 2-step entry rejects δ.
+        let z = orbit("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", 256, 5000);
+        for dc in [Fe::new(1.0, -40), Fe::new(1.0, -20), Fe::new(1.0, -200)] {
+            let t = build(&z, dc);
+            for l in 1..t.levels.len() {
+                for (j, e) in t.levels[l].iter().enumerate() {
+                    let first = &t.levels[l - 1][2 * j];
+                    assert!(!first.r.lt(e.r), "level {l} entry {j}: radius above its first half's");
+                    // As stored (format.rs): f32 mantissa, i32 exponent.
+                    let (r2, r2f) = (e.r.mul(e.r), first.r.mul(first.r));
+                    let stored = |v: Fe| ((v.m as f32) as f64, v.e);
+                    let ((m, ex), (mf, exf)) = (stored(r2), stored(r2f));
+                    assert!(m == 0.0 || super::super::fexp::ldexp(m, ex - exf) <= mf, "stored r² not monotone");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn approximation_error_is_small_where_valid() {
         let z = orbit("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", 256, 4000);
         let spacing = Fe::new(1.0, -60);

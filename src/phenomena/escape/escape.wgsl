@@ -505,6 +505,15 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       let mm = m - 1u;
       var l = min(countTrailingZeros(mm), P.bla_levels);
       let d2 = dot(d, d);
+      // Radii shrink with the level at a given start (merge: R ≤ R of the
+      // first half), so if the 2-step entry rejects δ, every longer one does.
+      if (l > 1u) {
+        let i1 = bla_off[0] + (mm >> 1u);
+        if (i1 < bla_off[1]) {
+          let e1 = bla[i1];
+          if (!(d2 < ldexp(e1.r2m, e1.r2e))) { l = 0u; }
+        }
+      }
       loop {
         if (l == 0u) { break; }
         let span = 1u << l;
@@ -617,6 +626,14 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       let mm = m - 1u;
       var l = min(countTrailingZeros(mm), P.bla_levels);
       let d2 = cf_norm2(d);
+      // As in MODE 2: a rejection by the 2-step entry rejects all longer ones.
+      if (l > 1u) {
+        let i1 = bla_off[0] + (mm >> 1u);
+        if (i1 < bla_off[1]) {
+          let e1 = bla[i1];
+          if (!fe_less_pos(d2, FE(e1.r2m, e1.r2e))) { l = 0u; }
+        }
+      }
       loop {
         if (l == 0u) { break; }
         let span = 1u << l;
