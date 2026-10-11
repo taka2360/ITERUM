@@ -93,13 +93,22 @@ struct Counters {
   unfinished_mid: atomic<u32>,    // ... step 1 pixels
   iterations256: atomic<u32>,     // iterations advanced this frame / 256 (BLA spans count fully)
   cycling: atomic<u32>,           // pixels found cycling (also counted in interior)
+  // Loop steps actually executed (a BLA span counts as one), 64-bit: low, high word.
+  steps_lo: atomic<u32>,
+  steps_hi: atomic<u32>,
+  waiting: atomic<u32>,           // unfinished pixels that wait for a longer orbit
 }
 
 var<workgroup> wg_iterations: atomic<u32>;
+var<workgroup> wg_steps: atomic<u32>;
 var<workgroup> wg_keep: atomic<u32>;
 var<workgroup> wg_base: u32;
 // Iteration budget of the pixel being processed (per progressive step).
 var<private> budget: u32;
+// Iterations skipped by BLA beyond one step per span (pixel being processed).
+var<private> bla_saved: u32;
+// Loop steps executed for the pixel being processed (set by process_pixel).
+var<private> loop_steps: u32;
 
 // List entries: pixel index | step << 30. ctl.count: entries in list 0, 1.
 // args (bound only to list_args, used as the indirect buffer): dispatch
@@ -292,6 +301,7 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
             m += span;
             n += span;
             skipped += span;
+            bla_saved += span - 1u;
             stepped = true;
             break;
           }
@@ -399,6 +409,7 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
             m += span;
             n += span;
             skipped += span;
+            bla_saved += span - 1u;
             stepped = true;
             break;
           }
@@ -478,6 +489,8 @@ fn step_of(pix: vec2<u32>) -> u32 {
 // step-2 budget; coarser steps get more); returns the number of iterations it moved forward.
 fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
   still_active = false;
+  bla_saved = 0u;
+  loop_steps = 0u;
   budget = max(16u, P.budget << (2u - step));
   let idx = pix.y * P.size.x + pix.x;
   var s = state[idx];
@@ -491,6 +504,7 @@ fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
       s.status = 0u;
     } else {
       atomicAdd(&counters.unfinished, 1u);
+      atomicAdd(&counters.waiting, 1u);
       if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
       if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
       still_active = true;
@@ -507,6 +521,8 @@ fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
     iterate_deep(&s, pix, idx);
   }
   state[idx] = s;
+  loop_steps = s.n - n0 - bla_saved;
+  if (s.status == 5u) { atomicAdd(&counters.waiting, 1u); }
   if (s.status == 0u || s.status == 5u) {
     if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
     if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
@@ -527,14 +543,26 @@ fn process(gid: vec3<u32>) -> u32 {
   return process_pixel(pix, P.step);
 }
 
+// Adds to the 64-bit step counter (carry detected from the returned old value).
+fn add_steps(v: u32) {
+  if (v == 0u) { return; }
+  let old = atomicAdd(&counters.steps_lo, v);
+  if (old > 0xffffffffu - v) { atomicAdd(&counters.steps_hi, 1u); }
+}
+
 @compute @workgroup_size(8, 8)
 fn iterate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  if (li == 0u) { atomicStore(&wg_iterations, 0u); }
+  if (li == 0u) { atomicStore(&wg_iterations, 0u); atomicStore(&wg_steps, 0u); }
   workgroupBarrier();
   // One global atomic per workgroup keeps the throughput counter cheap.
+  loop_steps = 0u;
   atomicAdd(&wg_iterations, process(gid));
+  atomicAdd(&wg_steps, loop_steps);
   workgroupBarrier();
-  if (li == 0u) { atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u); }
+  if (li == 0u) {
+    atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u);
+    add_steps(atomicLoad(&wg_steps));
+  }
 }
 
 fn list_read(which: u32, i: u32) -> u32 {
@@ -584,7 +612,7 @@ fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw
 fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let i = (wid.y * nwg.x + wid.x) * LIST_GROUP + li;
   let count = atomicLoad(&ctl.count[P.list_in]);
-  if (li == 0u) { atomicStore(&wg_iterations, 0u); }
+  if (li == 0u) { atomicStore(&wg_iterations, 0u); atomicStore(&wg_steps, 0u); }
   workgroupBarrier();
   var entry = 0u;
   var keep = false;
@@ -593,10 +621,14 @@ fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) 
     let idx = entry & 0x3fffffffu;
     let pix = vec2<u32>(idx % P.size.x, idx / P.size.x);
     atomicAdd(&wg_iterations, process_pixel(pix, entry >> 30u));
+    atomicAdd(&wg_steps, loop_steps);
     keep = still_active;
   }
   workgroupBarrier();
-  if (li == 0u) { atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u); }
+  if (li == 0u) {
+    atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u);
+    add_steps(atomicLoad(&wg_steps));
+  }
   list_append(li, keep, entry, 1u - P.list_in);
 }
 

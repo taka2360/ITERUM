@@ -16,13 +16,14 @@ const ja = JSON.parse(readFileSync(join(a, "golden.json"), "utf8"));
 const jb = JSON.parse(readFileSync(join(b, "golden.json"), "utf8"));
 const med = (xs) => { const s = [...xs].sort((x, y) => x - y); return s[s.length >> 1]; };
 const timing = (r, k) => (r.timing?.length ? med(r.timing.map((t) => t[k])) : NaN);
+const fileName = (name) => name.replace(/[^\w.-]/g, "_");
 const cls = (s) => (s >= 0 ? "esc" : s > -1.5 ? "in" : "anom");
 let allSame = true;
 const rows = [];
 for (const rb of jb.results) {
   const ra = ja.results.find((r) => r.name === rb.name);
-  const fa = join(a, `${rb.name}.bin`);
-  const fb = join(b, `${rb.name}.bin`);
+  const fa = join(a, `${fileName(rb.name)}.bin`);
+  const fb = join(b, `${fileName(rb.name)}.bin`);
   if (!ra || !existsSync(fa)) continue;
   const A = new Float32Array(readFileSync(fa).buffer.slice(0));
   const B = new Float32Array(readFileSync(fb).buffer.slice(0));
@@ -47,6 +48,21 @@ for (const rb of jb.results) {
     }
   }
   if (identical !== n) allSame = false;
+  // Per-pixel status and iteration count (golden runs that saved them).
+  let statusDiff = "-", countDiff = "-";
+  const sa = join(a, `${fileName(rb.name)}.state.bin`), sb = join(b, `${fileName(rb.name)}.state.bin`);
+  if (existsSync(sa) && existsSync(sb)) {
+    const SA = new Uint32Array(readFileSync(sa).buffer.slice(0));
+    const SB = new Uint32Array(readFileSync(sb).buffer.slice(0));
+    let ds = 0, dn = 0;
+    for (let i = 0; i < Math.min(SA.length, SB.length); i += 2) {
+      if (SA[i] !== SB[i]) ds++;
+      else if (SA[i + 1] !== SB[i + 1]) dn++;
+    }
+    statusDiff = ds;
+    countDiff = dn;
+    if (ds || dn) allSame = false;
+  }
   rows.push({
     view: rb.name,
     identical: `${((identical / n) * 100).toFixed(4)}%`,
@@ -55,10 +71,13 @@ for (const rb of jb.results) {
     maxSmooth: +maxSmooth.toExponential(2),
     maxDeRel: +maxDeRel.toExponential(2),
     maxTrap: +maxTrap.toExponential(2),
+    statusDiff,
+    countDiff,
     wallS: `${timing(ra, "wallS")} → ${timing(rb, "wallS")} (×${(timing(ra, "wallS") / timing(rb, "wallS")).toFixed(2)})`,
     gpuMs: `${timing(ra, "gpuEscapeMs")} → ${timing(rb, "gpuEscapeMs")}`,
     maxIter: `${ra.maxIter} → ${rb.maxIter}`,
     iterations: `${(ra.iterations / 1e9).toFixed(2)}G → ${(rb.iterations / 1e9).toFixed(2)}G`,
+    steps: ra.steps !== undefined ? `${(timing(ra, "steps") / 1e9).toFixed(2)}G → ${(timing(rb, "steps") / 1e9).toFixed(2)}G` : "-",
   });
 }
 console.log(`baseline ${ja.commit} (${ja.date})  vs  candidate ${jb.commit} (${jb.date})`);

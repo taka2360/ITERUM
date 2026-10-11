@@ -20,6 +20,8 @@ export interface OrbitInfo extends GpuOrbit {
   dcMaxLog2: number;
   maxIter: number;
   computeMs: number;
+  /** Time spent on the Rust side: orbit, BLA table, encoding (ms). */
+  rustMs: [number, number, number];
 }
 
 export interface DecodedPacket {
@@ -31,6 +33,7 @@ export interface DecodedPacket {
   minLog2Abs: number;
   bits: number;
   dcMaxLog2: number;
+  rustMs: [number, number, number];
   offsets: Uint32Array<ArrayBuffer>;
   orbit: Uint8Array<ArrayBuffer>;
   bla: Uint8Array<ArrayBuffer>;
@@ -55,6 +58,7 @@ export function decodePacket(buf: ArrayBuffer): DecodedPacket {
     minLog2Abs: hf[6],
     bits: h[7],
     dcMaxLog2: hf[42],
+    rustMs: [hf[43], hf[44], hf[45]],
     offsets,
     orbit: new Uint8Array(buf, orbitStart, len * 16),
     bla: new Uint8Array(buf, blaStart, offsets[levels] * 32),
@@ -191,6 +195,7 @@ export class OrbitManager {
       dcMaxLog2: p.dcMaxLog2,
       maxIter,
       computeMs: ms,
+      rustMs: p.rustMs,
     };
     if (old) {
       // Let in-flight frames finish before freeing.

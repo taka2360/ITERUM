@@ -344,7 +344,10 @@ export class Mandelbrot implements Phenomenon {
     const off = o ? this.refOffset(o.ref, frame.pixelRatio) : undefined;
     const tooFar = !off || Math.hypot(off[0], off[1]) > halfDiag * 3;
     const tooShallow = !o || o.bits < needBits - 24;
-    const tooShort = o !== undefined && !o.escaped && !o.periodic && o.maxIter < maxIter;
+    // Pixels wait at the end of a truncated orbit (index o.maxIter, reached at
+    // iteration o.maxIter at the earliest), and the limit is not raised while
+    // any pixel waits: an orbit only as long as the limit must be extended too.
+    const tooShort = o !== undefined && !o.escaped && !o.periodic && o.maxIter <= maxIter;
     if (o && tooShort && !tooFar && !tooShallow) {
       // Same reference, longer: the GPU keeps computing with the current orbit
       // (pixels rebase at its end) and switches without starting over.

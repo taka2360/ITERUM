@@ -121,7 +121,7 @@ pub async fn reference_orbit(state: State<'_, DeepZoomState>, req: OrbitRequest)
         let table = bla::build(&orbit.z, Fe::from_log2(req.dc_max_log2));
         let t2 = Instant::now();
         set_phase(&progress, "encode");
-        let bytes = format::encode(&format::Packet {
+        let mut bytes = format::encode(&format::Packet {
             id,
             orbit: &orbit.z,
             escaped: orbit.escaped,
@@ -131,6 +131,11 @@ pub async fn reference_orbit(state: State<'_, DeepZoomState>, req: OrbitRequest)
             bla: &table,
             dc_max_log2: req.dc_max_log2,
         });
+        let t3 = Instant::now();
+        for (k, ms) in [(t1 - t0), (t2 - t1), (t3 - t2)].iter().enumerate() {
+            let w = ((ms.as_secs_f64() * 1e3) as f32).to_bits().to_le_bytes();
+            bytes[(43 + k) * 4..(44 + k) * 4].copy_from_slice(&w);
+        }
         println!(
             "[iterum] orbit id={id} len={} bits={} escaped={} periodic={} orbit={:.1}ms bla={:.1}ms bytes={}",
             orbit.z.len(),

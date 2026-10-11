@@ -7,6 +7,7 @@
 //!   [6] min log2|Z_n| (f32 bits)   [7] precision bits
 //!   [8..8+K+1] BLA level offsets in entries (level l = 1..=K; last = total)
 //!   [42] log2 |δc|max the table was built for (f32 bits)
+//!   [43..46] milliseconds spent on orbit, BLA table, encoding (f32 bits; diagnostics)
 //! Orbit: M × { re: f32, im: f32, e: i32, pad: u32 }      (CFExp, 16 B)
 //! BLA:   N × { a: CFExp(12 B), b: CFExp(12 B), r2: f32, r2e: i32 }  (32 B)
 //!

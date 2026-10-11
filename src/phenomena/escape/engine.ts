@@ -103,7 +103,7 @@ export interface EscapeStats {
   maxIter: number;
 }
 
-const COUNTER_BYTES = 52;
+const COUNTER_BYTES = 64;
 // Largest per-pixel budget of a full-grid pass (list mode allows more).
 const FULL_BUDGET_MAX = 1 << 16;
 const PARAM_BYTES = 96;
@@ -202,6 +202,17 @@ export class EscapeEngine {
   iterationsTotal = 0;
   /** Times the iteration limit was raised (benchmarks). */
   restarts = 0;
+  /** Loop steps actually executed since init (a BLA span counts once); benchmarks. */
+  stepsTotal = 0;
+  /** Frames that recorded iteration work since init. */
+  computeFrames = 0;
+  /**
+   * Frames recorded after every pixel of a sample had stopped, before the CPU
+   * acted on it (benchmarks): `limit` when it then raised the iteration limit,
+   * `sample` when it moved on to the next sample. `orbit`: frames whose only
+   * unfinished pixels were waiting for a longer reference orbit.
+   */
+  waitFrames = { limit: 0, sample: 0, orbit: 0 };
 
   constructor(private palette: () => PaletteTexture) {}
 
@@ -453,6 +464,7 @@ export class EscapeEngine {
 
     if (!this.converged && compute) {
       this.framesSinceJob++;
+      this.computeFrames++;
       const groups = this.computeGroupsFor(view.orbit);
       const jit = JITTER[this.sample % JITTER.length];
       const writeParams = (target: GPUBuffer, step: number, listIn: number) => {
@@ -478,7 +490,7 @@ export class EscapeEngine {
         u[19] = listIn;
         device.queue.writeBuffer(target, 0, buf);
       };
-      device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0, 0]));
+      device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
       if (!this.listMode) {
         for (let step = 0; step < 3; step++) writeParams(this.params[step], step, 0);
         const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
@@ -577,6 +589,7 @@ export class EscapeEngine {
     const job = this.job;
     const sample = this.sample;
     const maxIter = this.maxIter;
+    const frameNo = this.computeFrames;
     queueMicrotask(() => {
       // mapAsync must be issued after submit; the frame loop submits synchronously
       // after render() returns, and microtasks run after the current task.
@@ -586,18 +599,19 @@ export class EscapeEngine {
           const c = new Uint32Array(rb.buffer.getMappedRange().slice(0));
           rb.buffer.unmap();
           rb.busy = false;
-          this.onCounters(job, sample, maxIter, c);
+          this.onCounters(job, sample, maxIter, c, frameNo);
         })
         .catch(() => (rb.busy = false));
     });
   }
 
-  private onCounters(job: number, sample: number, maxIter: number, c: Uint32Array): void {
+  private onCounters(job: number, sample: number, maxIter: number, c: Uint32Array, frameNo: number): void {
     // Throughput counts all work, including frames of superseded jobs.
     const now = performance.now();
     const pr = this.prog;
     pr.rate.push({ t: now, n: c[11] * 256 });
     this.iterationsTotal += c[11] * 256;
+    this.stepsTotal += c[14] * 4294967296 + c[13];
     while (pr.rate.length > 2 && now - pr.rate[0].t > 1000) pr.rate.shift();
     pr.anyUnfinished = c[0];
     pr.anyCoarse = c[9];
@@ -623,20 +637,24 @@ export class EscapeEngine {
     a.blaSteps += c[7];
     a.late += c[8];
     a.cycling += c[12];
+    if (c[0] !== 0 && c[0] === c[15]) this.waitFrames.orbit++;
     // Few pixels left: from now on dispatch only those.
     if (c[0] !== 0 && !this.listMode && c[0] < this.width * this.height * this.compactBelow) {
       this.listMode = true;
       this.listBuild = true;
     }
     if (c[0] !== 0) return;
-    // Sample complete.
+    // Sample complete. Frames recorded since then had nothing to do.
+    const idle = this.computeFrames - frameNo;
     this.lastComplete = this.stats();
     if (this.sample === 0) {
       if (this.wantsMoreIterations()) {
+        this.waitFrames.limit += idle;
         this.extendIterations();
         return;
       }
     }
+    this.waitFrames.sample += idle;
     this.samplesDone++;
     if (this.samplesDone >= this.sampleTarget) {
       this.converged = true;
