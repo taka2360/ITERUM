@@ -35,6 +35,9 @@ npm run test:rust    # cargo test（固定小数点、基準軌道 vs astro-floa
 npm run test:gpu     # 実機 GPU の正当性テスト（アプリを起動し、結果を表示して終了）
 npm run bench        # ベンチマーク（artifacts/bench.json）
 npm run shots        # 確認用スクリーンショット（artifacts/*.png）
+npm run golden -- artifacts/golden-a   # 固定視点の計算結果と所要時間を保存（速度改善の前後比較用）
+node scripts/golden-diff.mjs artifacts/golden-a artifacts/golden-b   # 2 回分をビット単位で比較
+cargo run --release --manifest-path src-tauri/Cargo.toml --example orbit_bench   # 基準軌道の計算速度
 npm run voyages      # Voyage の目的地を再生成
 ```
 
