@@ -16,8 +16,11 @@ import { VOYAGES } from "../phenomena/mandelbrot/voyages";
 import { diag, envVar, exitApp, saveFile } from "../platform";
 import { outDir, seconds } from "./harness";
 
+// Comparison resolution (samples are saved) and timing resolution (3 runs, median).
 const W = 640;
 const H = 360;
+const TIMING: [number, number] = [2560, 1440];
+const TIMING_RUNS = 3;
 const ORBIT_ITER = 1 << 20;
 
 interface GoldenView {
@@ -58,27 +61,27 @@ export interface GoldenResult {
   orbitMs?: number;
 }
 
-async function orbitFor(orbits: OrbitManager, cam: DeepCamera, log2s: number): Promise<number> {
+async function orbitFor(orbits: OrbitManager, cam: DeepCamera, log2s: number, w: number, h: number): Promise<number> {
   orbits.reset();
   const t0 = performance.now();
-  orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, Math.ceil(-log2s) + 64 + 32, ORBIT_ITER, log2s + Math.log2(Math.hypot(W, H) * 2));
+  orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, Math.ceil(-log2s) + 64 + 32, ORBIT_ITER, log2s + Math.log2(Math.hypot(w, h) * 2));
   while (!orbits.current && performance.now() - t0 < 300000) await seconds(0.02);
   if (!orbits.current) throw new Error(`orbit failed: ${orbits.lastError ?? "timeout"}`);
   return performance.now() - t0;
 }
 
 /** Renders one view to convergence; returns the engine (caller disposes) and timings. */
-export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManager, configure?: (e: EscapeEngine) => void): Promise<{ engine: EscapeEngine; result: GoldenResult }> {
+export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManager, w = W, h = H, configure?: (e: EscapeEngine) => void): Promise<{ engine: EscapeEngine; result: GoldenResult }> {
   let view: EscapeView;
   let orbitMs: number | undefined;
   if (gv.direct) {
     const d = gv.direct;
-    view = { mode: d.mode, spacing: feFromLog2(Math.log2(d.width / W)), center: d.center, cmr: [0, 0], juliaC: d.juliaC ?? [0, 0] };
+    view = { mode: d.mode, spacing: feFromLog2(Math.log2(d.width / w)), center: d.center, cmr: [0, 0], juliaC: d.juliaC ?? [0, 0] };
   } else {
     const d = gv.deep!;
-    const log2s = d.widthLog2 - Math.log2(W);
+    const log2s = d.widthLog2 - Math.log2(w);
     const cam = new DeepCamera(d.re, d.im, log2s);
-    orbitMs = await orbitFor(orbits, cam, log2s);
+    orbitMs = await orbitFor(orbits, cam, log2s, w, h);
     const o = orbits.current!;
     const mode = log2s > -100 && o.minLog2Abs > -100 && o.dcMaxLog2 > -120 ? MODE_PERTURB : MODE_DEEP;
     view = { mode, spacing: feFromLog2(log2s), center: [0, 0], cmr: [0, 0], juliaC: [0, 0], orbit: o };
@@ -98,7 +101,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
     const encoder = device.createCommandEncoder();
     timer.beginFrame();
     engine.setView(view, null);
-    engine.render({ gpu: app.gpu, encoder, timer, time: 0, dt: 1 / 60, paused: false, palette: app.palette.palette, width: W, height: H, pixelRatio: 1 });
+    engine.render({ gpu: app.gpu, encoder, timer, time: 0, dt: 1 / 60, paused: false, palette: app.palette.palette, width: w, height: h, pixelRatio: 1 });
     const after = timer.endFrame(encoder);
     device.queue.submit([encoder.finish()]);
     after?.();
@@ -135,14 +138,22 @@ export async function runGolden(app: App): Promise<void> {
   const dir = `${await outDir()}`;
   const only = await envVar("ITERUM_ONLY");
   const orbits = new OrbitManager(app.gpu.device);
-  const results: GoldenResult[] = [];
+  const results: (GoldenResult & { timing?: GoldenResult[] })[] = [];
+  const timingOff = (await envVar("ITERUM_TIMING")) === "0";
   for (const gv of GOLDEN_VIEWS.filter((v) => !only || only.split(",").includes(v.name))) {
     const { engine, result } = await renderGolden(app, gv, orbits);
     const samples = await engine.readSamples();
     await saveFile(`${dir}/${gv.name}.bin`, new Uint8Array(samples.buffer));
     engine.dispose();
-    results.push(result);
     diag(`GOLDEN ${JSON.stringify(result)}`);
+    const timing: GoldenResult[] = [];
+    for (let r = 0; r < (timingOff ? 0 : TIMING_RUNS); r++) {
+      const t = await renderGolden(app, gv, orbits, TIMING[0], TIMING[1]);
+      t.engine.dispose();
+      timing.push(t.result);
+      diag(`TIMING ${JSON.stringify(t.result)}`);
+    }
+    results.push({ ...result, timing });
   }
   const info = app.gpu.adapterInfo;
   const report = {
@@ -150,6 +161,7 @@ export async function runGolden(app: App): Promise<void> {
     commit: (await envVar("ITERUM_COMMIT")) ?? "unknown",
     adapter: { vendor: info.vendor, architecture: info.architecture, description: info.description, timestamps: app.gpu.hasTimestamps },
     resolution: [W, H],
+    timingResolution: TIMING,
     views: GOLDEN_VIEWS,
     results,
   };

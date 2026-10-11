@@ -14,6 +14,8 @@ if (!a || !b) {
 }
 const ja = JSON.parse(readFileSync(join(a, "golden.json"), "utf8"));
 const jb = JSON.parse(readFileSync(join(b, "golden.json"), "utf8"));
+const med = (xs) => { const s = [...xs].sort((x, y) => x - y); return s[s.length >> 1]; };
+const timing = (r, k) => (r.timing?.length ? med(r.timing.map((t) => t[k])) : NaN);
 const cls = (s) => (s >= 0 ? "esc" : s > -1.5 ? "in" : "anom");
 let allSame = true;
 const rows = [];
@@ -53,8 +55,8 @@ for (const rb of jb.results) {
     maxSmooth: +maxSmooth.toExponential(2),
     maxDeRel: +maxDeRel.toExponential(2),
     maxTrap: +maxTrap.toExponential(2),
-    wallS: `${ra.wallS} → ${rb.wallS} (×${(ra.wallS / rb.wallS).toFixed(2)})`,
-    gpuMs: `${ra.gpuEscapeMs} → ${rb.gpuEscapeMs}`,
+    wallS: `${timing(ra, "wallS")} → ${timing(rb, "wallS")} (×${(timing(ra, "wallS") / timing(rb, "wallS")).toFixed(2)})`,
+    gpuMs: `${timing(ra, "gpuEscapeMs")} → ${timing(rb, "gpuEscapeMs")}`,
     maxIter: `${ra.maxIter} → ${rb.maxIter}`,
     iterations: `${(ra.iterations / 1e9).toFixed(2)}G → ${(rb.iterations / 1e9).toFixed(2)}G`,
   });
