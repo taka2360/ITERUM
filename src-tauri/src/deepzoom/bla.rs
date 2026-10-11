@@ -69,6 +69,57 @@ pub fn build(z: &[CFe], dc_max: Fe) -> BlaTable {
     BlaTable { levels }
 }
 
+/// What appending to a table needs to know about the entries built so far:
+/// the entry count of every level, and each level's last entry (the only one
+/// a later merge can still pair with a new entry).
+#[derive(Clone)]
+pub struct Frontier {
+    pub counts: Vec<usize>,
+    pub last: Vec<Option<BlaEntry>>,
+}
+
+impl Frontier {
+    pub const EMPTY: Frontier = Frontier { counts: Vec::new(), last: Vec::new() };
+}
+
+/// The entries that exist for an orbit of `len` points beyond those already
+/// built (`from`), level by level, and the new frontier. Entries depend only
+/// on their span of the orbit and on `dc_max`, so appending gives exactly the
+/// table `build` makes for the whole orbit (same `dc_max` assumed).
+pub fn build_tail(z: &[CFe], dc_max: Fe, from: &Frontier) -> (Vec<Vec<BlaEntry>>, Frontier) {
+    let m_len = z.len();
+    let mut levels: Vec<Vec<BlaEntry>> = Vec::new();
+    let mut counts = Vec::new();
+    let mut last = Vec::new();
+    // Level 0: steps starting at m = 1..=M-2.
+    let mut count = m_len.saturating_sub(2);
+    let old0 = from.counts.first().copied().unwrap_or(0);
+    let mut new: Vec<BlaEntry> = (old0 + 1..=count).map(|m| single_step(z[m])).collect();
+    let mut level = 0;
+    loop {
+        let old = from.counts.get(level).copied().unwrap_or(0);
+        let prev_last = from.last.get(level).copied().flatten();
+        counts.push(count);
+        last.push(new.last().copied().or(prev_last));
+        let done = count < 2;
+        let entries = std::mem::take(&mut new);
+        if !done {
+            // Level + 1 pairs entries (2j, 2j + 1) of this level.
+            let next_count = count / 2;
+            let next_old = from.counts.get(level + 1).copied().unwrap_or(0);
+            let at = |i: usize| if i >= old { entries[i - old] } else { prev_last.expect("an unpaired entry is the last one") };
+            new = (next_old..next_count).map(|j| merge(&at(2 * j), &at(2 * j + 1), dc_max)).collect();
+            levels.push(entries);
+            count = next_count;
+            level += 1;
+        } else {
+            levels.push(entries);
+            break;
+        }
+    }
+    (levels, Frontier { counts, last })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +156,59 @@ mod tests {
         // Some level must have coefficients outside the f32 exponent range.
         let max_log2 = t.levels.iter().flatten().map(|e| e.a.abs().log2()).fold(f64::MIN, f64::max);
         assert!(max_log2 > 128.0, "expected coefficients beyond f32 range, got 2^{max_log2}");
+    }
+
+    fn same(a: &BlaEntry, b: &BlaEntry) -> bool {
+        let c = |x: CFe, y: CFe| x.re.to_bits() == y.re.to_bits() && x.im.to_bits() == y.im.to_bits() && x.e == y.e;
+        c(a.a, b.a) && c(a.b, b.b) && a.r.m.to_bits() == b.r.m.to_bits() && a.r.e == b.r.e
+    }
+
+    #[test]
+    fn appended_table_equals_full_build() {
+        let z = orbit("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", 256, 5000);
+        let dc = Fe::new(1.0, -40);
+        for cuts in [vec![3usize, 4, 5, 6, 7, 1000, 1001, 4097], vec![2, 2049], vec![1, 3000, 3001, 3002], vec![4097]] {
+            let mut frontier = Frontier::EMPTY;
+            let mut acc: Vec<Vec<BlaEntry>> = Vec::new();
+            for &len in cuts.iter() {
+                let (tail, f) = build_tail(&z[..len], dc, &frontier);
+                for (l, entries) in tail.into_iter().enumerate() {
+                    if acc.len() <= l {
+                        acc.push(Vec::new());
+                    }
+                    acc[l].extend(entries);
+                }
+                frontier = f;
+                let full = build(&z[..len], dc);
+                let full_levels: Vec<_> = full.levels.iter().filter(|l| !l.is_empty()).collect();
+                let got: Vec<_> = acc.iter().filter(|l| !l.is_empty()).collect();
+                assert_eq!(got.len(), full_levels.len(), "levels at len {len}");
+                for (a, b) in got.iter().zip(&full_levels) {
+                    assert_eq!(a.len(), b.len(), "len {len}");
+                    assert!(a.iter().zip(b.iter()).all(|(x, y)| same(x, y)), "entries differ at len {len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn radius_never_grows_with_the_level_at_a_start() {
+        // escape.wgsl skips every longer span once the 2-step entry rejects δ.
+        let z = orbit("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", 256, 5000);
+        for dc in [Fe::new(1.0, -40), Fe::new(1.0, -20), Fe::new(1.0, -200)] {
+            let t = build(&z, dc);
+            for l in 1..t.levels.len() {
+                for (j, e) in t.levels[l].iter().enumerate() {
+                    let first = &t.levels[l - 1][2 * j];
+                    assert!(!first.r.lt(e.r), "level {l} entry {j}: radius above its first half's");
+                    // As stored (format.rs): f32 mantissa, i32 exponent.
+                    let (r2, r2f) = (e.r.mul(e.r), first.r.mul(first.r));
+                    let stored = |v: Fe| ((v.m as f32) as f64, v.e);
+                    let ((m, ex), (mf, exf)) = (stored(r2), stored(r2f));
+                    assert!(m == 0.0 || super::super::fexp::ldexp(m, ex - exf) <= mf, "stored r² not monotone");
+                }
+            }
+        }
     }
 
     #[test]

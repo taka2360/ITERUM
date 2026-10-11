@@ -43,6 +43,7 @@ pub fn run() {
             exit_app,
             deepzoom::reference_orbit,
             deepzoom::bla_table,
+            deepzoom::component_patches,
             deepzoom::cancel_orbit,
             deepzoom::orbit_progress,
             deepzoom::direct_iterate,

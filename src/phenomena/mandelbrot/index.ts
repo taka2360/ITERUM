@@ -19,7 +19,7 @@ import {
   EscapeEngine, MODE_DEEP, MODE_DIRECT, MODE_NAMES, MODE_PERTURB,
   type EscapeMode, type EscapeView, type HistoryMap,
 } from "../escape/engine";
-import { OrbitManager, hasTauri } from "./orbit";
+import { OrbitManager, hasTauri, orbitReference, requestPatches } from "./orbit";
 import { VOYAGES, type VoyageTarget } from "./voyages";
 
 const SUPERSCRIPT = "⁰¹²³⁴⁵⁶⁷⁸⁹";
@@ -63,6 +63,11 @@ export class Mandelbrot implements Phenomenon {
   private needsHome = true;
   private paletteDrift = 0;
   private lastSpacingLog2 = 0;
+  // Component proofs (orbit.ts, requestPatches): the view they are for, when
+  // it last changed, and whether they were requested.
+  private patchKey = "";
+  private patchSince = 0;
+  private patchAsked = false;
 
   constructor(palette: () => PaletteTexture) {
     this.engine = new EscapeEngine(palette);
@@ -136,6 +141,38 @@ export class Mandelbrot implements Phenomenon {
     this.voyage = { target, index, phase: "approach", t: 0 };
     const cam = new DeepCamera(target.re, target.im, -target.depthLog2);
     this.glide = { re: cam.re, im: cam.im, frac: cam.frac };
+  }
+
+  /**
+   * Orbit length to request: at least 4096, and never beyond what the
+   * iteration cap can use (one more than the cap, so that no pixel ever waits
+   * at the end of an orbit the limit cannot outgrow).
+   */
+  private orbitLength(want: number): number {
+    return Math.min(Math.max(want, 4096), this.engine.maxIterCap + 1);
+  }
+
+  /**
+   * Once a perturbation view has stayed unchanged for a moment, asks for
+   * component proofs of its tiles; they apply only if it is still the view.
+   */
+  private managePatches(view: EscapeView, width: number, height: number): void {
+    const o = this.orbits?.current;
+    if (view.mode !== MODE_PERTURB || !o || view.orbit !== o) return;
+    const key = `${o.rustId}:${view.spacing.m}:${view.spacing.e}:${view.cmr[0]}:${view.cmr[1]}:${width}x${height}`;
+    const now = performance.now();
+    if (key !== this.patchKey) {
+      this.patchKey = key;
+      this.patchSince = now;
+      this.patchAsked = false;
+    }
+    if (this.patchAsked || now - this.patchSince < 250) return;
+    this.patchAsked = true;
+    requestPatches(o, view, width, height)
+      .then((buf) => {
+        if (this.patchKey === key) this.engine.setPatches(buf);
+      })
+      .catch(() => {});
   }
 
   /** Places the view at an exact location (used by benchmarks and tests). */
@@ -310,6 +347,7 @@ export class Mandelbrot implements Phenomenon {
         view.mode = range ? MODE_PERTURB : MODE_DEEP;
         view.cmr = cmr;
         view.orbit = o;
+        view.interiorRef = orbitReference(o);
       } else {
         this.holding = true;
       }
@@ -321,6 +359,7 @@ export class Mandelbrot implements Phenomenon {
       return this.engine.render(frame, false);
     }
     this.engine.setView(view, history);
+    this.managePatches(view, frame.width, frame.height);
     return this.engine.render(frame);
   }
 
@@ -344,17 +383,20 @@ export class Mandelbrot implements Phenomenon {
     const off = o ? this.refOffset(o.ref, frame.pixelRatio) : undefined;
     const tooFar = !off || Math.hypot(off[0], off[1]) > halfDiag * 3;
     const tooShallow = !o || o.bits < needBits - 24;
-    const tooShort = o !== undefined && !o.escaped && !o.periodic && o.maxIter < maxIter;
+    // Pixels wait at the end of a truncated orbit (index o.maxIter, reached at
+    // iteration o.maxIter at the earliest), and the limit is not raised while
+    // any pixel waits: an orbit only as long as the limit must be extended too.
+    const tooShort = o !== undefined && !o.escaped && !o.periodic && o.maxIter <= maxIter;
     if (o && tooShort && !tooFar && !tooShallow) {
       // Same reference, longer: the GPU keeps computing with the current orbit
       // (pixels rebase at its end) and switches without starting over.
-      orbits.request(o.ref, o.bits, Math.max(maxIter * 4, 4096), o.dcMaxLog2, o);
+      orbits.request(o.ref, o.bits, this.orbitLength(maxIter * 4), o.dcMaxLog2, o);
       return;
     }
     if (!o || tooFar || tooShallow) {
       // New reference at the view centre, with headroom for further zoom.
       const dcMaxLog2 = spacingLog2 + Math.log2(halfDiag * 4);
-      orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, needBits + 32, Math.max(maxIter * 2, 4096), dcMaxLog2);
+      orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, needBits + 32, this.orbitLength(maxIter * 2), dcMaxLog2);
       return;
     }
     // The BLA table is valid while |δc| stays below the bound it was built for;

@@ -13,13 +13,36 @@
 // orbit ends, the pixel rebases (δ ← z, m ← 0), so one reference serves the
 // whole image without glitches. BLA tables skip runs of steps while |δ| < R.
 //
+// Iteration limit: kept on the GPU (Counters.max_iter) and raised there by
+// decide_limit, so the GPU never waits for the CPU to read the counters back
+// before it continues. Each invocation reads it once at its start. The rule is
+// the CPU's former one: on sample 0, once no pixel is running, double the
+// limit if a noticeable share of escapes came late (in the upper half of the
+// range), or if nothing escaped yet (up to 2^17); never beyond the cap, and
+// never when no pixel stopped at the limit. The job aggregates it uses count
+// each event once: escaped/late/interior/cycling when a pixel reaches that
+// status; raising the limit resets late and returns interior to the pixels
+// that cannot resume (cycling).
+//
 // Status: 0 running, 1 escaped, 2 stopped at the iteration limit (not proven
 // interior; it resumes when the limit is raised, so its full state is kept),
 // 3 numeric anomaly, 4 cycling (see below), 5 waiting at the end of a
-// truncated reference orbit for its extension (see orbit_wait). BLA spans may
-// run past the current limit, so the path a pixel takes depends only on its
-// state (z, or δ and m), never on n or the limit: raising the limit and
-// resuming equals starting with the higher limit.
+// truncated reference orbit for its extension (see orbit_wait), 6 proven
+// interior (see "Proven interior"). BLA spans may run past the current limit,
+// so the path a pixel takes depends only on its state (z, or δ and m), never
+// on n or the limit: raising the limit and resuming equals starting with the
+// higher limit.
+//
+// Proven interior: when a pixel starts, the closed-form tests for the main
+// cardioid and the period-2 disk are evaluated with a rigorous error bound
+// (PROOF.md, section 1); in MODE 2 also the patch of its tile, if the CPU
+// proved one: |λ|² − 1 of a component's cycle as a polynomial with a bound
+// (section 2). Patches arrive while the image is computed; the retest pass
+// then checks the pixels that have not finished. A pixel that passes is
+// interior for certain. It
+// iterates only as long as its interior shading needs (shading_steps), then
+// finishes with status 6 whatever the iteration limit. The proof decides the
+// status; the shading of such a pixel is an approximation (PROOF.md, section 3).
 //
 // Cycles: the iteration is deterministic, so once a pixel's complete state
 // repeats bit for bit it will repeat forever and never escape. Its result
@@ -51,7 +74,7 @@ struct Params {
   julia_c: vec2<f32>,
   spacing_m: f32,        // complex units per pixel, floatexp
   spacing_e: i32,
-  max_iter: u32,
+  max_iter_cap: u32,     // the limit is never raised beyond this
   budget: u32,
   orbit_len: u32,
   bla_levels: u32,
@@ -62,7 +85,16 @@ struct Params {
   // pixel's offset in f32, so pixels wait there instead and continue exactly
   // when the extension arrives. 0: rebase at the end (complete orbits).
   orbit_wait: u32,
-  _p0: u32, _p1: u32, _p2: u32,
+  ref_x: f32, ref_y: f32,  // reference point, rounded (perturbation modes; shading only)
+  // Fewest steps a proven-interior pixel iterates for its shading; 0 disables
+  // the closed-form interior tests (Julia, or no exact reference point).
+  trap_iters: u32,
+  // Raises of the limit the CPU has seen; until it sees a new one (and lowers
+  // its budget for the pixels that rejoin), budgets are capped by budget_safe.
+  acked_raises: u32,
+  budget_safe: u32,
+  list_mode: u32,        // decide_limit: rebuild list 1 − list_in after a raise
+  patches_on: u32,       // the patch uniform holds proofs for this view
 }
 
 struct PixelState {
@@ -93,18 +125,45 @@ struct Counters {
   unfinished_mid: atomic<u32>,    // ... step 1 pixels
   iterations256: atomic<u32>,     // iterations advanced this frame / 256 (BLA spans count fully)
   cycling: atomic<u32>,           // pixels found cycling (also counted in interior)
+  // Loop steps actually executed (a BLA span counts as one), 64-bit: low, high word.
+  steps_lo: atomic<u32>,
+  steps_hi: atomic<u32>,
+  waiting: atomic<u32>,           // unfinished pixels that wait for a longer orbit
+  proven: atomic<u32>,            // pixels finished as proven interior (also counted in interior)
+  // Per job (the CPU clears these when a job starts; only decide_limit writes them).
+  max_iter: u32,                  // current iteration limit
+  raises: u32,                    // times decide_limit raised it in this job
+  raised_now: u32,                // decide_limit raised it in this frame
+  frame_max_iter: u32,            // the limit this frame's iteration used
+  agg_escaped: u32,
+  agg_late: u32,
+  agg_interior: u32,
+  agg_cycling: u32,
+  agg_proven: u32,
+  // The totals the latest raise was decided on (diagnostics).
+  raise_escaped: u32,
+  raise_late: u32,
+  raise_paused: u32,
 }
 
 var<workgroup> wg_iterations: atomic<u32>;
+var<workgroup> wg_steps: atomic<u32>;
 var<workgroup> wg_keep: atomic<u32>;
 var<workgroup> wg_base: u32;
 // Iteration budget of the pixel being processed (per progressive step).
 var<private> budget: u32;
+// Iteration limit, read once per invocation (see "Iteration limit").
+var<private> max_iter: u32;
+// Iterations skipped by BLA beyond one step per span (pixel being processed).
+var<private> bla_saved: u32;
+// Loop steps executed for the pixel being processed (set by process_pixel).
+var<private> loop_steps: u32;
 
 // List entries: pixel index | step << 30. ctl.count: entries in list 0, 1.
 // args (bound only to list_args, used as the indirect buffer): dispatch
 // arguments (x, y, z, _) for list 0, then for list 1.
 struct ListCtl { count: array<atomic<u32>, 4> }
+// args[8..11]: indirect arguments of the list rebuild decide_limit requests.
 const LIST_GROUP: u32 = 64u;
 const MAX_GROUPS_X: u32 = 32768u;
 
@@ -118,7 +177,20 @@ const MAX_GROUPS_X: u32 = 32768u;
 @group(0) @binding(7) var<storage, read_write> list0: array<u32>;
 @group(0) @binding(8) var<storage, read_write> list1: array<u32>;
 @group(0) @binding(9) var<storage, read_write> ctl: ListCtl;
-@group(0) @binding(10) var<storage, read_write> args: array<u32, 8>;
+// Closed-form interior tests: coefficients of g (G_TERMS) then h (H_TERMS)
+// around the reference point (interior.ts).
+struct Term { m: f32, e: i32, i: u32, j: u32 }
+const G_TERMS: u32 = 6u;
+const H_TERMS: u32 = 15u;
+@group(0) @binding(11) var<uniform> terms: array<Term, 21>;
+// Component proofs, one per tile of a PATCH_GRID² grid over the image
+// (component.rs, PATCH_BYTES): |λ(u)|² − 1 for u = (δc − d0) / 2^rho_e,
+// |u| ≤ 1, with `bound` covering everything the 15 terms leave out.
+struct PatchHead { d0: vec2<f32>, rho_e: i32, period: u32, bound_m: f32, bound_e: i32, _a: u32, _b: u32 }
+struct PatchRec { head: PatchHead, t: array<Term, 15> }
+const PATCH_GRID: u32 = 8u;
+@group(0) @binding(13) var<uniform> patches: array<PatchRec, 64>;
+@group(0) @binding(10) var<storage, read_write> args: array<u32, 12>;
 
 #include floatexp
 
@@ -137,6 +209,12 @@ fn rel_pos(pix: vec2<u32>) -> vec2<f32> {
 
 fn spacing_fe() -> FE { return FE(P.spacing_m, P.spacing_e); }
 fn spacing_f() -> f32 { return ldexp(P.spacing_m, P.spacing_e); }
+
+// The pixel's parameter, exactly as the iteration uses it: c (MODE 0), or
+// δc = c − reference (MODE 2 f32, MODE 3 floatexp).
+fn direct_c(pix: vec2<u32>) -> vec2<f32> { return P.center + rel_pos(pix) * spacing_f(); }
+fn perturb_dc(pix: vec2<u32>) -> vec2<f32> { return (rel_pos(pix) + P.cmr) * spacing_f(); }
+fn deep_dc(pix: vec2<u32>) -> CF { return cf_scale(cf_make(rel_pos(pix) + P.cmr, 0), spacing_fe()); }
 
 fn orbit_cf(m: u32) -> CF { let o = orbit[m]; return CF(vec2<f32>(o.re, o.im), o.e); }
 fn orbit_f(m: u32) -> vec2<f32> { let o = orbit[m]; return ldexp(vec2<f32>(o.re, o.im), vec2<i32>(o.e)); }
@@ -158,7 +236,7 @@ fn finish_escaped(s: ptr<function, PixelState>, idx: u32, z: vec2<f32>, log2_g: 
   atomicAdd(&counters.escaped, 1u);
   atomicMax(&counters.max_escaped_n, (*s).n);
   atomicMin(&counters.min_escaped_n, (*s).n);
-  if ((*s).n > P.max_iter / 2u) { atomicAdd(&counters.late_escapes, 1u); }
+  if ((*s).n > max_iter / 2u) { atomicAdd(&counters.late_escapes, 1u); }
 }
 
 // Stops at the iteration limit. The caller has stored the iteration state, so
@@ -187,6 +265,221 @@ fn finish_anomaly(s: ptr<function, PixelState>, idx: u32) {
   (*s).status = 3u;
   samples[P.sample * P.size.x * P.size.y + idx] = vec2<f32>(-2.0, 0.0);
   atomicAdd(&counters.anomalies, 1u);
+}
+
+// ---- proven interior (PROOF.md, section 1) ----------------------------------
+
+const PROVEN_CARDIOID: u32 = 0x80000000u; // flags in PixelState.rebases
+const PROVEN_P2: u32 = 0x40000000u;
+const PROVEN_COMPONENT: u32 = 0x20000000u;
+const PROVEN_ANY: u32 = 0xe0000000u;
+
+fn fe_mul(a: FE, b: FE) -> FE { return fe_make(a.m * b.m, a.e + b.e); }
+fn fe_add(a: FE, b: FE) -> FE {
+  let r = cf_add(CF(vec2<f32>(a.m, 0.0), a.e), CF(vec2<f32>(b.m, 0.0), b.e));
+  return FE(r.v.x, r.e);
+}
+
+// Value v of the polynomial terms[start..start+count] at (dx, dy) and the sum
+// t of the absolute values of its terms.
+struct PolyVal { v: FE, t: FE }
+
+fn poly_eval(start: u32, count: u32, dx: FE, dy: FE) -> PolyVal {
+  var px: array<FE, 5>;
+  var py: array<FE, 5>;
+  px[0] = FE(0.5, 1);
+  py[0] = FE(0.5, 1);
+  for (var k = 1u; k < 5u; k++) {
+    px[k] = fe_mul(px[k - 1u], dx);
+    py[k] = fe_mul(py[k - 1u], dy);
+  }
+  var v = FE(0.0, 0);
+  var t = FE(0.0, 0);
+  for (var k = 0u; k < count; k++) {
+    let a = terms[start + k];
+    if (a.m == 0.0) { continue; }
+    let term = fe_mul(fe_mul(FE(a.m, a.e), px[a.i]), py[a.j]);
+    v = fe_add(v, term);
+    t = fe_add(t, FE(abs(term.m), term.e));
+  }
+  return PolyVal(v, t);
+}
+
+// True only if the polynomial is certainly negative at (dx, dy): computed
+// value plus the error bound 2^-16 · Σ|terms| < 0.
+fn poly_negative(start: u32, count: u32, dx: FE, dy: FE) -> bool {
+  let p = poly_eval(start, count, dx, dy);
+  if (p.t.m == 0.0) { return false; }
+  let w = fe_add(p.v, FE(p.t.m, p.t.e - 16));
+  return w.m < 0.0;
+}
+
+// The pixel's c (MODE 0) or δc (MODE 2, 3) as floatexp components; ok is
+// false if a component is subnormal (fe_make could flush it).
+struct PixelD { dx: FE, dy: FE, ok: bool }
+
+fn pixel_d(pix: vec2<u32>) -> PixelD {
+  var d = vec2<f32>(0.0);
+  var e = 0;
+  if (MODE == 0u) {
+    d = direct_c(pix);
+  } else if (MODE == 2u) {
+    d = perturb_dc(pix);
+  } else {
+    let dc = deep_dc(pix);
+    d = dc.v;
+    e = dc.e;
+  }
+  return PixelD(fe_make(d.x, e), fe_make(d.y, e), !subnormal(d.x) && !subnormal(d.y));
+}
+
+fn subnormal(x: f32) -> bool { return x != 0.0 && abs(x) < 1.17549435e-38; }
+
+// Closed-form interior flags of the pixel (0 if not proven).
+fn closed_form_interior(pix: vec2<u32>) -> u32 {
+  let d = pixel_d(pix);
+  // A subnormal input could be flushed by fe_make (frexp): no proof then.
+  if (!d.ok) { return 0u; }
+  if (poly_negative(G_TERMS, H_TERMS, d.dx, d.dy)) { return PROVEN_CARDIOID; }
+  if (poly_negative(0u, G_TERMS, d.dx, d.dy)) { return PROVEN_P2; }
+  return 0u;
+}
+
+// Steps a proven pixel iterates for its shading (smallest |z|² of the orbit).
+// Near the boundary of a component (multiplier |λ| = 1 − η, η small) the
+// orbit keeps passing close to 0 for a while before it settles: measured at
+// the period-2 boundary, the last such pass came within 5/√η steps. So the
+// pixel runs 16/√η steps (at least P.trap_iters).
+// η comes from the polynomial value, which is accurate where f32 c is not:
+// period 2: |λ| = 4|c+1| = √(1 + 16 g) ≈ 1 + 8g; cardioid: η ≈ −h |λ'(c)| / |∇h|
+// with λ'(c) = 2 / √(1 − 4c).
+const NO_SHORTCUT: u32 = 0xffffffffu;
+
+fn shading_steps(pix: vec2<u32>, flags: u32) -> u32 {
+  let d = pixel_d(pix);
+  var v: FE;
+  var factor = 8.0;
+  if ((flags & PROVEN_COMPONENT) != 0u) {
+    // v = |λ|² − 1 ≈ −2η.
+    v = patch_eval(pix).v;
+    factor = 0.5;
+  } else if ((flags & PROVEN_CARDIOID) != 0u) {
+    v = poly_eval(G_TERMS, H_TERMS, d.dx, d.dy).v;
+    let c = approx_c(pix);
+    let u = c.x - 0.25;
+    let q = u * u + c.y * c.y;
+    let grad = length(vec2<f32>((2.0 * q + u) * 2.0 * u + q, (2.0 * q + u) * 2.0 * c.y - 0.5 * c.y));
+    let s = length(csqrt(vec2<f32>(1.0, 0.0) - 4.0 * c));
+    // Near the cusp at 1/4 this estimate breaks down: no shortcut there.
+    if (grad < 1e-3 || s < 1e-3) { return NO_SHORTCUT; }
+    factor = 2.0 / (s * grad);
+  } else {
+    v = poly_eval(0u, G_TERMS, d.dx, d.dy).v;
+  }
+  if (v.m >= 0.0) { return NO_SHORTCUT; }
+  let eta_log2 = log2(-v.m) + f32(v.e) + log2(factor);
+  let steps_log2 = 4.0 - 0.5 * eta_log2;
+  if (steps_log2 >= 31.0) { return NO_SHORTCUT; }
+  return max(P.trap_iters, u32(exp2(max(steps_log2, 0.0))));
+}
+
+// The pixel's patch: |λ|² − 1 (v) and its error bound (e), if it has one.
+struct PatchVal { ok: bool, v: FE, e: FE }
+
+fn patch_eval(pix: vec2<u32>) -> PatchVal {
+  let none = PatchVal(false, FE(0.0, 0), FE(0.0, 0));
+  if (MODE != 2u || P.patches_on == 0u) { return none; }
+  let tx = min(pix.x * PATCH_GRID / P.size.x, PATCH_GRID - 1u);
+  let ty = min(pix.y * PATCH_GRID / P.size.y, PATCH_GRID - 1u);
+  let rec = ty * PATCH_GRID + tx;
+  let h = patches[rec].head;
+  if (h.period == 0u) { return none; }
+  // u differs from the exact (δc − d0)/ρ by at most 2^-21 (f32 rounding of
+  // d0 and of the difference; the CPU added that to the bound), so
+  // |u|² ≤ 0.9999 keeps the exact u inside the proven disc.
+  let u = ldexp(perturb_dc(pix) - h.d0, vec2<i32>(-h.rho_e));
+  if (dot(u, u) > 0.9999 || subnormal(u.x) || subnormal(u.y)) { return none; }
+  var px: array<FE, 5>;
+  var py: array<FE, 5>;
+  px[0] = FE(0.5, 1);
+  py[0] = FE(0.5, 1);
+  let ux = fe_make(u.x, 0);
+  let uy = fe_make(u.y, 0);
+  for (var k = 1u; k < 5u; k++) {
+    px[k] = fe_mul(px[k - 1u], ux);
+    py[k] = fe_mul(py[k - 1u], uy);
+  }
+  var v = FE(0.0, 0);
+  var t = FE(0.0, 0);
+  for (var k = 0u; k < 15u; k++) {
+    let a = patches[rec].t[k];
+    if (a.m == 0.0) { continue; }
+    let term = fe_mul(fe_mul(FE(a.m, a.e), px[a.i]), py[a.j]);
+    v = fe_add(v, term);
+    t = fe_add(t, FE(abs(term.m), term.e));
+  }
+  // Evaluation error (as for the closed forms) plus the patch's bound; the
+  // CPU sends the bound with 2^-18 to spare, more than this addition can lose.
+  return PatchVal(true, v, fe_add(FE(t.m, t.e - 16), FE(h.bound_m, h.bound_e)));
+}
+
+fn patch_interior(pix: vec2<u32>) -> u32 {
+  let p = patch_eval(pix);
+  if (!p.ok) { return 0u; }
+  let w = fe_add(p.v, p.e);
+  if (w.m < 0.0) { return PROVEN_COMPONENT; }
+  return 0u;
+}
+
+fn csqrt(a: vec2<f32>) -> vec2<f32> {
+  let r = length(a);
+  let x = sqrt(max(0.0, 0.5 * (r + a.x)));
+  var y = sqrt(max(0.0, 0.5 * (r - a.x)));
+  if (a.y < 0.0) { y = -y; }
+  return vec2<f32>(x, y);
+}
+
+// The pixel's parameter, rounded to f32 (shading only).
+fn approx_c(pix: vec2<u32>) -> vec2<f32> {
+  if (MODE == 0u) { return direct_c(pix); }
+  if (MODE == 2u) { return vec2<f32>(P.ref_x, P.ref_y) + perturb_dc(pix); }
+  return vec2<f32>(P.ref_x, P.ref_y) + cf_to_vec2(deep_dc(pix));
+}
+
+// Smallest |z|² on the attracting cycle (fixed point, or the 2-cycle; other
+// components: not known here).
+fn cycle_trap(c: vec2<f32>, flags: u32) -> f32 {
+  if ((flags & PROVEN_COMPONENT) != 0u) { return 1e30; }
+  if ((flags & PROVEN_CARDIOID) != 0u) {
+    let z = 0.5 * (vec2<f32>(1.0, 0.0) - csqrt(vec2<f32>(1.0, 0.0) - 4.0 * c));
+    return dot(z, z);
+  }
+  let w = csqrt(vec2<f32>(-3.0, 0.0) - 4.0 * c);
+  let a = 0.5 * (vec2<f32>(-1.0, 0.0) + w);
+  let b = 0.5 * (vec2<f32>(-1.0, 0.0) - w);
+  return min(dot(a, a), dot(b, b));
+}
+
+// Iteration count at which the pixel stops: the limit, or for a proven pixel
+// its shading steps if they come first.
+fn stop_at(flags: u32, pix: vec2<u32>) -> u32 {
+  if ((flags & PROVEN_ANY) != 0u) { return min(max_iter, shading_steps(pix, flags)); }
+  return max_iter;
+}
+
+// Stops at stop_at(): a proven pixel that has iterated its shading steps
+// finishes; any other pauses at the limit (a proven one too: its shading is
+// not complete, so it resumes like any pixel when the limit is raised).
+fn stop_pixel(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
+  if (((*s).rebases & PROVEN_ANY) != 0u && (*s).n >= shading_steps(pix, (*s).rebases)) {
+    (*s).status = 6u;
+    (*s).trap = min((*s).trap, cycle_trap(approx_c(pix), (*s).rebases));
+    samples[P.sample * P.size.x * P.size.y + idx] = vec2<f32>(-1.0, sqrt((*s).trap));
+    atomicAdd(&counters.interior, 1u);
+    atomicAdd(&counters.proven, 1u);
+    return;
+  }
+  pause_at_limit(s, idx);
 }
 
 fn init_state(pix: vec2<u32>) -> PixelState {
@@ -218,14 +511,15 @@ fn iterate_direct(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   let sp = spacing_f();
   var c = P.julia_c;
   var gc = 0.0;
-  if (MODE == 0u) { c = P.center + rel_pos(pix) * sp; gc = sp; }
+  if (MODE == 0u) { c = direct_c(pix); gc = sp; }
+  let stop = stop_at((*s).rebases, pix);
   var cyc = z;          // Brent: saved state, steps since saving, power of two
   var cyc_len = 0u;
   var cyc_pow = 1u;
   for (var k = 0u; k < budget; k++) {
-    if (n >= P.max_iter) {
+    if (n >= stop) {
       (*s).dr = z.x; (*s).di = z.y; (*s).gr = g.x; (*s).gi = g.y; (*s).n = n;
-      pause_at_limit(s, idx);
+      stop_pixel(s, pix, idx);
       return;
     }
     g = 2.0 * cmul(z, g) + vec2<f32>(gc, 0.0);
@@ -245,7 +539,6 @@ fn iterate_direct(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   }
   if (bad2(g)) { g = vec2<f32>(1e30, 0.0); }
   (*s).dr = z.x; (*s).di = z.y; (*s).gr = g.x; (*s).gi = g.y; (*s).n = n;
-  atomicAdd(&counters.unfinished, 1u);
 }
 
 // ---- perturbation with f32 deltas (MODE 2) ---------------------------------
@@ -258,19 +551,22 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var rebases = 0u;
   var skipped = 0u;
   let sp = spacing_f();
-  let dc = (rel_pos(pix) + P.cmr) * sp;
+  let dc = perturb_dc(pix);
   let last = P.orbit_len - 1u;
+  let stop = stop_at((*s).rebases, pix);
+  // Z_m, carried from step to step: each step reads only the next point.
+  var zm = orbit_f(m);
   var cyc_d = d;        // Brent: saved state (δ, m)
   var cyc_m = m;
   var cyc_len = 0u;
   var cyc_pow = 1u;
   for (var k = 0u; k < budget; k++) {
-    if (n >= P.max_iter) {
+    if (n >= stop) {
       (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
-      pause_at_limit(s, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      stop_pixel(s, pix, idx);
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     var stepped = false;
@@ -278,6 +574,15 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       let mm = m - 1u;
       var l = min(countTrailingZeros(mm), P.bla_levels);
       let d2 = dot(d, d);
+      // Radii shrink with the level at a given start (merge: R ≤ R of the
+      // first half), so if the 2-step entry rejects δ, every longer one does.
+      if (l > 1u) {
+        let i1 = bla_off[0] + (mm >> 1u);
+        if (i1 < bla_off[1]) {
+          let e1 = bla[i1];
+          if (!(d2 < ldexp(e1.r2m, e1.r2e))) { l = 0u; }
+        }
+      }
       loop {
         if (l == 0u) { break; }
         let span = 1u << l;
@@ -292,6 +597,7 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
             m += span;
             n += span;
             skipped += span;
+            bla_saved += span - 1u;
             stepped = true;
             break;
           }
@@ -300,13 +606,13 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       }
     }
     if (!stepped) {
-      let zm = orbit_f(m);
       g = 2.0 * cmul(zm + d, g) + vec2<f32>(sp, 0.0);
       d = cmul(2.0 * zm + d, d) + dc;
       m++;
       n++;
     }
-    let z = orbit_f(m) + d;
+    zm = orbit_f(m);
+    let z = zm + d;
     let r2 = dot(z, z);
     (*s).trap = min((*s).trap, r2);
     if (r2 > BAIL2) {
@@ -314,22 +620,22 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       var lg = 0.5 * log2(dot(g, g));
       if (bad2(g)) { lg = 120.0; }
       finish_escaped(s, idx, z, lg);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     if (m >= last && r2 >= dot(d, d) && P.orbit_wait != 0u) {
       (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
       (*s).status = 5u;
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-      atomicAdd(&counters.unfinished, 1u);
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     if (r2 < dot(d, d) || m >= last) {
       d = z;
       m = 0u;
+      zm = orbit_f(0u);
       rebases++;
     }
     if (bad2(d)) { (*s).n = n; finish_anomaly(s, idx); return; }
@@ -337,8 +643,8 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).n = n;
       (*s).rebases += rebases;
       finish_cycling(s, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     cyc_len++;
@@ -347,9 +653,8 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   if (bad2(g)) { g = vec2<f32>(1e30, 0.0); }
   (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
   (*s).rebases += rebases;
-  atomicAdd(&counters.rebases, rebases);
-  if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-  atomicAdd(&counters.unfinished, 1u);
+  pv_rebases += rebases;
+  pv_bla += skipped;
 }
 
 // ---- perturbation with floatexp deltas (MODE 3) ----------------------------
@@ -363,21 +668,24 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var skipped = 0u;
   let sp = spacing_fe();
   let sp_c = CF(vec2<f32>(sp.m, 0.0), sp.e);
-  let dc = cf_scale(cf_make(rel_pos(pix) + P.cmr, 0), sp);
+  let dc = deep_dc(pix);
   let last = P.orbit_len - 1u;
+  let stop = stop_at((*s).rebases, pix);
+  // Z_m, carried from step to step: each step reads only the next point.
+  var zm = orbit_cf(m);
   var cyc_d = d;        // Brent: saved state (δ, m)
   var cyc_m = m;
   var cyc_len = 0u;
   var cyc_pow = 1u;
   for (var k = 0u; k < budget; k++) {
-    if (n >= P.max_iter) {
+    if (n >= stop) {
       (*s).dr = d.v.x; (*s).di = d.v.y; (*s).de = d.e;
       (*s).gr = g.v.x; (*s).gi = g.v.y; (*s).ge = g.e;
       (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
-      pause_at_limit(s, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      stop_pixel(s, pix, idx);
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     var stepped = false;
@@ -385,6 +693,14 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       let mm = m - 1u;
       var l = min(countTrailingZeros(mm), P.bla_levels);
       let d2 = cf_norm2(d);
+      // As in MODE 2: a rejection by the 2-step entry rejects all longer ones.
+      if (l > 1u) {
+        let i1 = bla_off[0] + (mm >> 1u);
+        if (i1 < bla_off[1]) {
+          let e1 = bla[i1];
+          if (!fe_less_pos(d2, FE(e1.r2m, e1.r2e))) { l = 0u; }
+        }
+      }
       loop {
         if (l == 0u) { break; }
         let span = 1u << l;
@@ -399,6 +715,7 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
             m += span;
             n += span;
             skipped += span;
+            bla_saved += span - 1u;
             stepped = true;
             break;
           }
@@ -407,13 +724,13 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       }
     }
     if (!stepped) {
-      let zm = orbit_cf(m);
       g = cf_add(cf_mul(cf_add(zm, d), cf_scale(g, FE(0.5, 2))), sp_c);
       d = cf_add(cf_mul(cf_add(cf_scale(zm, FE(0.5, 2)), d), d), dc);
       m++;
       n++;
     }
-    let z = cf_add(orbit_cf(m), d);
+    zm = orbit_cf(m);
+    let z = cf_add(zm, d);
     if (z.e < -40) { (*s).trap = 0.0; }
     if (z.e >= -40) {
       let zf = cf_to_vec2(z);
@@ -422,8 +739,8 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
         (*s).n = n;
         let lg = log2(length(g.v)) + f32(g.e);
         finish_escaped(s, idx, zf, lg);
-        atomicAdd(&counters.rebases, rebases);
-        if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+        pv_rebases += rebases;
+        pv_bla += skipped;
         return;
       }
     }
@@ -434,14 +751,14 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
       (*s).status = 5u;
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-      atomicAdd(&counters.unfinished, 1u);
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     if (closer || m >= last) {
       d = z;
       m = 0u;
+      zm = orbit_cf(0u);
       rebases++;
     }
     if (bad2(d.v)) { (*s).n = n; finish_anomaly(s, idx); return; }
@@ -449,8 +766,8 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       (*s).n = n;
       (*s).rebases += rebases;
       finish_cycling(s, idx);
-      atomicAdd(&counters.rebases, rebases);
-      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      pv_rebases += rebases;
+      pv_bla += skipped;
       return;
     }
     cyc_len++;
@@ -460,13 +777,44 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   (*s).gr = g.v.x; (*s).gi = g.v.y; (*s).ge = g.e;
   (*s).m = m; (*s).n = n;
   (*s).rebases += rebases;
-  atomicAdd(&counters.rebases, rebases);
-  if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
-  atomicAdd(&counters.unfinished, 1u);
+  pv_rebases += rebases;
+  pv_bla += skipped;
 }
 
 // Running (or waiting for a longer orbit) after this pass: stays in the list.
 var<private> still_active: bool;
+// The pixel waits for a longer orbit; rebases and BLA-skipped iterations of
+// this pass. Summed per workgroup (tally) instead of a global atomic per pixel.
+var<private> waiting_now: bool;
+var<private> pv_rebases: u32;
+var<private> pv_bla: u32;
+var<workgroup> wg_tally: array<atomic<u32>, 6>;
+
+// Adds the pixel's tallies; called by every invocation of the group in
+// uniform control flow, then one invocation adds the group's sums.
+fn tally(li: u32, step: u32) {
+  if (li == 0u) { for (var k = 0u; k < 6u; k++) { atomicStore(&wg_tally[k], 0u); } }
+  workgroupBarrier();
+  if (still_active) {
+    atomicAdd(&wg_tally[0], 1u);
+    if (step == 0u) { atomicAdd(&wg_tally[1], 1u); }
+    if (step == 1u) { atomicAdd(&wg_tally[2], 1u); }
+  }
+  if (waiting_now) { atomicAdd(&wg_tally[3], 1u); }
+  if (pv_rebases > 0u) { atomicAdd(&wg_tally[4], pv_rebases); }
+  if (pv_bla > 0u) { atomicAdd(&wg_tally[5], pv_bla); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let t = array<u32, 6>(atomicLoad(&wg_tally[0]), atomicLoad(&wg_tally[1]), atomicLoad(&wg_tally[2]),
+                          atomicLoad(&wg_tally[3]), atomicLoad(&wg_tally[4]), atomicLoad(&wg_tally[5]));
+    if (t[0] > 0u) { atomicAdd(&counters.unfinished, t[0]); }
+    if (t[1] > 0u) { atomicAdd(&counters.unfinished_coarse, t[1]); }
+    if (t[2] > 0u) { atomicAdd(&counters.unfinished_mid, t[2]); }
+    if (t[3] > 0u) { atomicAdd(&counters.waiting, t[3]); }
+    if (t[4] > 0u) { atomicAdd(&counters.rebases, t[4]); }
+    if (t[5] > 0u) { atomicAdd(&counters.bla_steps, t[5]); }
+  }
+}
 
 fn step_of(pix: vec2<u32>) -> u32 {
   if ((pix.x & 3u) == 0u && (pix.y & 3u) == 0u) { return 0u; }
@@ -478,22 +826,32 @@ fn step_of(pix: vec2<u32>) -> u32 {
 // step-2 budget; coarser steps get more); returns the number of iterations it moved forward.
 fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
   still_active = false;
+  waiting_now = false;
+  pv_rebases = 0u;
+  pv_bla = 0u;
+  bla_saved = 0u;
+  loop_steps = 0u;
   budget = max(16u, P.budget << (2u - step));
+  if (counters.raises != P.acked_raises) { budget = min(budget, max(16u, P.budget_safe << (2u - step))); }
   let idx = pix.y * P.size.x + pix.x;
   var s = state[idx];
-  if (s.job != P.job) { s = init_state(pix); }
+  if (s.job != P.job) {
+    s = init_state(pix);
+    if (P.trap_iters != 0u && MODE != 1u) {
+      s.rebases = closed_form_interior(pix);
+      if (s.rebases == 0u) { s.rebases = patch_interior(pix); }
+    }
+  }
   // Resume pixels stopped at an earlier, lower limit.
-  if (s.status == 2u && s.n < P.max_iter) { s.status = 0u; }
+  if (s.status == 2u && s.n < max_iter) { s.status = 0u; }
   // Waiting at the end of a truncated orbit: continue once it is longer (or
   // no extension is coming).
   if (s.status == 5u) {
     if (s.m + 1u < P.orbit_len || P.orbit_wait == 0u) {
       s.status = 0u;
     } else {
-      atomicAdd(&counters.unfinished, 1u);
-      if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
-      if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
       still_active = true;
+      waiting_now = true;
       return 0u;
     }
   }
@@ -507,11 +865,9 @@ fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
     iterate_deep(&s, pix, idx);
   }
   state[idx] = s;
-  if (s.status == 0u || s.status == 5u) {
-    if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
-    if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
-    still_active = true;
-  }
+  loop_steps = s.n - n0 - bla_saved;
+  waiting_now = s.status == 5u;
+  still_active = s.status == 0u || s.status == 5u;
   return min(s.n - n0, 1u << 25u);
 }
 
@@ -527,14 +883,28 @@ fn process(gid: vec3<u32>) -> u32 {
   return process_pixel(pix, P.step);
 }
 
+// Adds to the 64-bit step counter (carry detected from the returned old value).
+fn add_steps(v: u32) {
+  if (v == 0u) { return; }
+  let old = atomicAdd(&counters.steps_lo, v);
+  if (old > 0xffffffffu - v) { atomicAdd(&counters.steps_hi, 1u); }
+}
+
 @compute @workgroup_size(8, 8)
 fn iterate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
-  if (li == 0u) { atomicStore(&wg_iterations, 0u); }
+  max_iter = counters.max_iter;
+  if (li == 0u) { atomicStore(&wg_iterations, 0u); atomicStore(&wg_steps, 0u); }
   workgroupBarrier();
   // One global atomic per workgroup keeps the throughput counter cheap.
+  loop_steps = 0u;
   atomicAdd(&wg_iterations, process(gid));
+  atomicAdd(&wg_steps, loop_steps);
   workgroupBarrier();
-  if (li == 0u) { atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u); }
+  if (li == 0u) {
+    atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u);
+    add_steps(atomicLoad(&wg_steps));
+  }
+  tally(li, P.step);
 }
 
 fn list_read(which: u32, i: u32) -> u32 {
@@ -566,6 +936,7 @@ fn list_append(li: u32, keep: bool, entry: u32, out: u32) {
 // has to advance. Dispatched 2D like iterate_list.
 @compute @workgroup_size(64)
 fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  max_iter = counters.max_iter;
   let total = P.size.x * P.size.y;
   let idx = (wid.y * nwg.x + wid.x) * LIST_GROUP + li;
   var keep = false;
@@ -573,7 +944,7 @@ fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw
   if (idx < total) {
     let pix = vec2<u32>(idx % P.size.x, idx / P.size.x);
     let s = state[idx];
-    keep = s.job != P.job || s.status == 0u || s.status == 5u || (s.status == 2u && s.n < P.max_iter);
+    keep = s.job != P.job || s.status == 0u || s.status == 5u || (s.status == 2u && s.n < max_iter);
     entry = idx | (step_of(pix) << 30u);
   }
   list_append(li, keep, entry, P.list_in);
@@ -582,9 +953,10 @@ fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nw
 // Advances the pixels of list P.list_in; those still running go to the other list.
 @compute @workgroup_size(64)
 fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  max_iter = counters.max_iter;
   let i = (wid.y * nwg.x + wid.x) * LIST_GROUP + li;
   let count = atomicLoad(&ctl.count[P.list_in]);
-  if (li == 0u) { atomicStore(&wg_iterations, 0u); }
+  if (li == 0u) { atomicStore(&wg_iterations, 0u); atomicStore(&wg_steps, 0u); }
   workgroupBarrier();
   var entry = 0u;
   var keep = false;
@@ -593,22 +965,96 @@ fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) 
     let idx = entry & 0x3fffffffu;
     let pix = vec2<u32>(idx % P.size.x, idx / P.size.x);
     atomicAdd(&wg_iterations, process_pixel(pix, entry >> 30u));
+    atomicAdd(&wg_steps, loop_steps);
     keep = still_active;
   }
   workgroupBarrier();
-  if (li == 0u) { atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u); }
+  if (li == 0u) {
+    atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u);
+    add_steps(atomicLoad(&wg_steps));
+  }
+  tally(li, entry >> 30u);
   list_append(li, keep, entry, 1u - P.list_in);
+}
+
+// Component proofs arrived: checks the current job's pixels that have not
+// finished. A pixel stopped at the limit that is proven and has iterated its
+// shading steps finishes now (it was counted as interior when it stopped).
+@compute @workgroup_size(8, 8)
+fn retest(@builtin(global_invocation_id) gid: vec3<u32>) {
+  max_iter = counters.max_iter;
+  let pix = gid.xy;
+  if (pix.x >= P.size.x || pix.y >= P.size.y || P.trap_iters == 0u) { return; }
+  let idx = pix.y * P.size.x + pix.x;
+  var s = state[idx];
+  if (s.job != P.job || (s.rebases & PROVEN_ANY) != 0u) { return; }
+  if (s.status != 0u && s.status != 2u && s.status != 5u) { return; }
+  let f = patch_interior(pix);
+  if (f == 0u) { return; }
+  s.rebases |= f;
+  if (s.status == 2u && s.n >= shading_steps(pix, s.rebases)) {
+    s.status = 6u;
+    samples[P.sample * P.size.x * P.size.y + idx] = vec2<f32>(-1.0, sqrt(s.trap));
+    atomicAdd(&counters.proven, 1u);
+  }
+  state[idx] = s;
+}
+
+// Dispatch size (x, y) for `groups` workgroups (x ≤ MAX_GROUPS_X).
+fn groups_2d(groups: u32) -> vec2<u32> {
+  let x = min(groups, MAX_GROUPS_X);
+  var y = 0u;
+  if (x > 0u) { y = (groups + x - 1u) / x; }
+  return vec2<u32>(x, y);
+}
+
+// After this frame's iteration: adds its events to the job aggregates and
+// raises the limit when the rule says so (see "Iteration limit"). In list
+// mode a raise also empties the list for the next frame and requests its
+// rebuild from the full grid (pixels stopped at the old limit rejoin).
+@compute @workgroup_size(1)
+fn decide_limit() {
+  let cur = counters.max_iter;
+  counters.frame_max_iter = cur;
+  counters.agg_escaped += atomicLoad(&counters.escaped);
+  counters.agg_late += atomicLoad(&counters.late_escapes);
+  counters.agg_interior += atomicLoad(&counters.interior);
+  counters.agg_cycling += atomicLoad(&counters.cycling);
+  counters.agg_proven += atomicLoad(&counters.proven);
+  counters.raised_now = 0u;
+  args[8] = 0u; args[9] = 1u; args[10] = 1u;
+  if (P.sample != 0u || atomicLoad(&counters.unfinished) != 0u) { return; }
+  if (cur >= P.max_iter_cap || counters.agg_interior == counters.agg_cycling + counters.agg_proven) { return; }
+  var more: bool;
+  if (counters.agg_escaped == 0u) {
+    // Nothing escaped: interior cannot be told from slow exterior. Keep
+    // looking, but not forever.
+    more = cur < (1u << 17u);
+  } else {
+    more = counters.agg_late > 16u && counters.agg_late * 500u > counters.agg_escaped;
+  }
+  if (!more) { return; }
+  counters.max_iter = min(P.max_iter_cap, cur * 2u);
+  counters.raises += 1u;
+  counters.raise_escaped = counters.agg_escaped;
+  counters.raise_late = counters.agg_late;
+  counters.raise_paused = counters.agg_interior - counters.agg_cycling - counters.agg_proven;
+  counters.raised_now = 1u;
+  counters.agg_interior = counters.agg_cycling + counters.agg_proven;
+  counters.agg_late = 0u;
+  if (P.list_mode != 0u) {
+    atomicStore(&ctl.count[1u - P.list_in], 0u);
+    let g = groups_2d((P.size.x * P.size.y + LIST_GROUP - 1u) / LIST_GROUP);
+    args[8] = g.x; args[9] = g.y;
+  }
 }
 
 // Indirect dispatch arguments for list P.list_in (2D: x ≤ MAX_GROUPS_X).
 @compute @workgroup_size(1)
 fn list_args() {
   let which = P.list_in;
-  let groups = (atomicLoad(&ctl.count[which]) + LIST_GROUP - 1u) / LIST_GROUP;
-  let x = min(groups, MAX_GROUPS_X);
-  var y = 0u;
-  if (x > 0u) { y = (groups + x - 1u) / x; }
-  args[which * 4u] = x;
-  args[which * 4u + 1u] = y;
+  let g = groups_2d((atomicLoad(&ctl.count[which]) + LIST_GROUP - 1u) / LIST_GROUP);
+  args[which * 4u] = g.x;
+  args[which * 4u + 1u] = g.y;
   args[which * 4u + 2u] = 1u;
 }

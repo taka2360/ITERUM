@@ -16,6 +16,18 @@ pub struct Orbit {
     pub periodic: bool,
     /// Smallest log2|Z_n| for n >= 1 (how close the orbit comes to zero).
     pub min_log2_abs: f64,
+    /// Exact fixed-point Z at the last point, to continue the orbit later
+    /// (None once it escaped or returned to zero: then it is complete).
+    pub end: Option<EndState>,
+}
+
+/// The exact state after the last computed point.
+#[derive(Clone)]
+pub struct EndState {
+    zr: Vec<u64>,
+    zi: Vec<u64>,
+    zr_neg: bool,
+    zi_neg: bool,
 }
 
 /// Fixed-point limb count that holds at least `bits` fractional bits.
@@ -32,27 +44,46 @@ pub fn compute(
     max_iter: u32,
     poll: &dyn Fn(u32) -> bool,
 ) -> Option<Orbit> {
+    let start = Orbit { z: vec![CFe::ZERO], escaped: false, periodic: false, min_log2_abs: f64::INFINITY, end: None };
+    extend(cr, ci, start, max_iter, poll)
+}
+
+/// Continues `orbit` (computed for the same c and precision) up to `max_iter`
+/// iterations. The result is bit-identical to computing it in one go. An
+/// orbit without an end state (complete, or never started) starts from Z_0 = 0.
+pub fn extend(
+    cr: &Fixed,
+    ci: &Fixed,
+    orbit: Orbit,
+    max_iter: u32,
+    poll: &dyn Fn(u32) -> bool,
+) -> Option<Orbit> {
     let limbs = cr.mag.len();
+    let Orbit { mut z, mut min_log2_abs, end, .. } = orbit;
     // Signed fixed-point values as (negative, limbs), updated in place by the
     // allocation-free kernels (bit-identical to the `Fixed` methods).
-    let (mut zr_neg, mut zi_neg) = (false, false);
-    let mut zr = vec![0u64; limbs];
-    let mut zi = vec![0u64; limbs];
+    let EndState { mut zr, mut zi, mut zr_neg, mut zi_neg } = match end {
+        Some(e) if e.zr.len() == limbs && z.len() > 1 => e,
+        _ => {
+            z.truncate(1);
+            min_log2_abs = f64::INFINITY;
+            EndState { zr: vec![0u64; limbs], zi: vec![0u64; limbs], zr_neg: false, zi_neg: false }
+        }
+    };
+    let first = z.len() as u32 - 1;
     let mut zr2 = vec![0u64; limbs];
     let mut zi2 = vec![0u64; limbs];
     let mut s = vec![0u64; limbs];
     let mut t = vec![0u64; limbs];
     let mut u = vec![0u64; limbs];
     let mut acc = vec![0u64; 2 * limbs + 1];
-    let mut z = Vec::with_capacity((max_iter as usize + 1).min(1 << 24));
-    z.push(CFe::ZERO);
+    z.reserve((max_iter as usize + 1).min(1 << 25).saturating_sub(z.len()));
     let mut escaped = false;
     let mut periodic = false;
-    let mut min_log2_abs = f64::INFINITY;
     let bail2 = BAILOUT * BAILOUT;
     // |Z| below this is zero at the working precision.
     let zero_log2 = -(64.0 * (limbs as f64 - 1.0)) + 48.0;
-    for n in 0..max_iter {
+    for n in first..max_iter {
         if n & 0xfff == 0 && poll(n) {
             return None;
         }
@@ -80,7 +111,8 @@ pub fn compute(
             break;
         }
     }
-    Some(Orbit { z, escaped, periodic, min_log2_abs })
+    let end = (!escaped && !periodic).then_some(EndState { zr, zi, zr_neg, zi_neg });
+    Some(Orbit { z, escaped, periodic, min_log2_abs, end })
 }
 
 /// Result of iterating a single point directly at full precision (verification oracle).
@@ -236,6 +268,31 @@ mod tests {
         let o = compute(&n.re, &n.im, 100000, &|_| false).unwrap();
         assert!(o.periodic && !o.escaped);
         assert_eq!(o.z.len(), 4);
+    }
+
+    #[test]
+    fn continued_orbit_is_bit_identical() {
+        let cases = [
+            ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", 128, [700u32, 2000, 5000]),
+            ("-1.249999772751977185", "-0.000336290822967596", 111, [4096, 4096, 30000]),
+            ("0", "1", 300, [1, 2, 3000]),
+            ("-1.75", "0", 64, [2, 10, 100]),
+        ];
+        for (re, im, bits, steps) in cases {
+            let (cr, ci) = (dec_to_fixed(re, bits), dec_to_fixed(im, bits));
+            let whole = compute(&cr, &ci, steps[2], &|_| false).unwrap();
+            let mut part = compute(&cr, &ci, steps[0], &|_| false).unwrap();
+            for &s in &steps[1..] {
+                part = extend(&cr, &ci, part, s, &|_| false).unwrap();
+            }
+            assert_eq!(part.z.len(), whole.z.len(), "{re}");
+            assert_eq!(part.escaped, whole.escaped);
+            assert_eq!(part.periodic, whole.periodic);
+            assert_eq!(part.min_log2_abs.to_bits(), whole.min_log2_abs.to_bits());
+            for (k, (a, b)) in part.z.iter().zip(&whole.z).enumerate() {
+                assert!(a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits() && a.e == b.e, "{re}: differs at {k}");
+            }
+        }
     }
 
     #[test]
