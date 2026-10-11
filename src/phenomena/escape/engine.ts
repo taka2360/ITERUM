@@ -14,6 +14,7 @@ import { hexToRgb } from "../../core/palettes";
 import type { Fe } from "../../core/floatexp";
 import { wgsl } from "../../shaders";
 import escapeSrc from "./escape.wgsl?raw";
+import { interiorTerms } from "./interior";
 import displaySrc from "./display.wgsl?raw";
 
 export const MODE_DIRECT = 0;
@@ -51,6 +52,11 @@ export interface EscapeView {
   cmr: [number, number];
   juliaC: [number, number];
   orbit?: GpuOrbit;
+  /**
+   * Perturbation modes: the reference point as an exact binary fraction
+   * (re, im) / 2^frac. Enables the closed-form interior tests there.
+   */
+  interiorRef?: { re: bigint; im: bigint; frac: number };
 }
 
 /** Maps an internal pixel of the new view to the previous frame: old = mid + (p − mid)·scale + offset. */
@@ -94,6 +100,8 @@ export interface EscapeStats {
   interior: number;
   /** Interior pixels found cycling (subset of interior). */
   cycling: number;
+  /** Interior pixels proven by the closed-form tests (subset of interior). */
+  proven: number;
   anomalies: number;
   rebases: number;
   blaSteps: number;
@@ -112,6 +120,8 @@ const C_RAISED_NOW = 19;
 const C_FRAME_MAX_ITER = 20;
 const C_AGG = 21; // escaped, late, interior, cycling, proven
 const COUNTER_BYTES = 26 * 4;
+// Coefficients of the closed-form interior tests (interior.ts).
+const TERM_BYTES = 21 * 16;
 // Largest per-pixel budget of a full-grid pass (list mode allows more).
 const FULL_BUDGET_MAX = 1 << 16;
 const PARAM_BYTES = 112;
@@ -162,6 +172,8 @@ export class EscapeEngine {
   private counters!: GPUBuffer;
   private readbacks: Readback[] = [];
   private dummy!: GPUBuffer;
+  private terms!: GPUBuffer;
+  private termsKey = "";
   private state?: GPUBuffer;
   private samples?: GPUBuffer;
   private outputs: GPUTexture[] = [];
@@ -200,6 +212,12 @@ export class EscapeEngine {
    */
   compactBelow = 0.25;
   /**
+   * Closed-form interior tests (escape.wgsl, "Proven interior"); a proven
+   * pixel iterates trapIters steps for its shading.
+   */
+  provenInterior = true;
+  trapIters = 1024;
+  /**
    * GPU time per frame for iteration, as a share of the measured frame
    * interval: more while the view is still (only the image refines), less
    * while it moves, and never above movingMaxMs then.
@@ -211,7 +229,7 @@ export class EscapeEngine {
   /** density: palette cycles per doubling of (iterations − sMin)/bandScale. */
   look = { offset: 0, density: 0.32, glow: 0.6, sMin: 0, bandScale: 6, interiorGlow: 0.3 };
 
-  private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0 };
+  private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0, proven: 0 };
   /** Aggregated statistics of the most recently completed sample. */
   lastComplete?: EscapeStats;
   /** Iterations advanced since init (BLA spans counted in full); benchmarks. */
@@ -252,6 +270,7 @@ export class EscapeEngine {
         { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: rw },
         { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: rw },
         { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
       ],
     });
     this.argsLayout = device.createBindGroupLayout({
@@ -326,6 +345,8 @@ export class EscapeEngine {
       busy: false,
     }));
     this.dummy = device.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE });
+    this.terms = device.createBuffer({ size: TERM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.termsKey = "";
     this.linear = device.createSampler({ magFilter: "linear", minFilter: "linear" });
     this.restart();
   }
@@ -392,7 +413,7 @@ export class EscapeEngine {
   }
 
   private resetAgg(): void {
-    this.agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0 };
+    this.agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0, proven: 0 };
   }
 
   /**
@@ -425,6 +446,7 @@ export class EscapeEngine {
       escaped: this.agg.escaped,
       interior: this.agg.interior,
       cycling: this.agg.cycling,
+      proven: this.agg.proven,
       anomalies: this.agg.anomalies,
       rebases: this.agg.rebases,
       blaSteps: this.agg.blaSteps,
@@ -453,6 +475,7 @@ export class EscapeEngine {
           { binding: 7, resource: { buffer: this.lists[0] } },
           { binding: 8, resource: { buffer: this.lists[1] } },
           { binding: 9, resource: { buffer: this.listCtl } },
+          { binding: 11, resource: { buffer: this.terms } },
         ],
       });
     this.computeGroups = this.params.map(group);
@@ -518,6 +541,12 @@ export class EscapeEngine {
         const o = view.orbit;
         u[20] = this.orbitExtends && o && !o.escaped && !o.periodic ? 1 : 0;
         u[19] = listIn;
+        const ref = view.interiorRef;
+        if (ref) {
+          f[21] = Number(ref.re) / 2 ** ref.frac;
+          f[22] = Number(ref.im) / 2 ** ref.frac;
+        }
+        u[23] = this.provenInterior && (view.mode === 0 || ((view.mode === 2 || view.mode === 3) && ref)) ? this.trapIters : 0;
         u[24] = this.raisesSeen;
         u[25] = Math.max(16, Math.round(Math.min(this.budget, FULL_BUDGET_MAX)));
         u[26] = this.listMode ? 1 : 0;
@@ -534,6 +563,7 @@ export class EscapeEngine {
         this.raisesSeen = 0;
       }
       device.queue.writeBuffer(this.counters, 0, cw);
+      this.writeTerms(view);
       if (!this.listMode) {
         for (let step = 0; step < 3; step++) writeParams(this.params[step], step, 0);
         const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
@@ -716,6 +746,7 @@ export class EscapeEngine {
     a.escaped = c[C_AGG];
     a.interior = c[C_AGG + 2];
     a.cycling = c[C_AGG + 3];
+    a.proven = c[C_AGG + 4];
     // No pixel running, and the GPU kept the limit: the sample is complete.
     if (c[0] !== 0 || c[C_RAISED_NOW]) return;
     const idle = this.computeFrames - frameNo;
@@ -804,6 +835,16 @@ export class EscapeEngine {
     };
   }
 
+  /** Coefficients of the closed-form interior tests around the view's reference point. */
+  private writeTerms(view: EscapeView): void {
+    const ref = view.mode === 0 ? { re: 0n, im: 0n, frac: 0 } : view.interiorRef;
+    if (!ref) return;
+    const key = `${ref.re}/${ref.im}/${ref.frac}`;
+    if (key === this.termsKey) return;
+    this.termsKey = key;
+    this.device.queue.writeBuffer(this.terms, 0, interiorTerms(ref.re, ref.im, ref.frac));
+  }
+
   /** Lowers the iteration limit after zooming out (called on view changes). */
   relaxIterations(): void {
     const s = this.lastComplete;
@@ -853,6 +894,7 @@ export class EscapeEngine {
     for (const l of this.lists) l.destroy();
     this.listCtl?.destroy();
     this.listArgs?.destroy();
+    this.terms?.destroy();
     for (const r of this.readbacks) r.buffer.destroy();
   }
 }

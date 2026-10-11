@@ -19,7 +19,7 @@ import {
   EscapeEngine, MODE_DEEP, MODE_DIRECT, MODE_NAMES, MODE_PERTURB,
   type EscapeMode, type EscapeView, type HistoryMap,
 } from "../escape/engine";
-import { OrbitManager, hasTauri } from "./orbit";
+import { OrbitManager, hasTauri, orbitReference } from "./orbit";
 import { VOYAGES, type VoyageTarget } from "./voyages";
 
 const SUPERSCRIPT = "⁰¹²³⁴⁵⁶⁷⁸⁹";
@@ -319,6 +319,7 @@ export class Mandelbrot implements Phenomenon {
         view.mode = range ? MODE_PERTURB : MODE_DEEP;
         view.cmr = cmr;
         view.orbit = o;
+        view.interiorRef = orbitReference(o);
       } else {
         this.holding = true;
       }

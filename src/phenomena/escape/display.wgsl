@@ -80,8 +80,8 @@ fn current(idx: u32) -> vec2<f32> {
   let s = state[idx];
   // Running, or waiting for a longer reference orbit: not finished yet.
   if (s.job != D.job || s.status == 0u || s.status == 5u) { return vec2<f32>(NONE, 0.0); }
-  // Stopped at the iteration limit (state kept for resuming) or proven interior.
-  if (s.status == 2u || s.status == 4u) { return vec2<f32>(-1.0, sqrt(s.trap)); }
+  // Stopped at the iteration limit (state kept for resuming), cycling or proven interior.
+  if (s.status == 2u || s.status == 4u || s.status == 6u) { return vec2<f32>(-1.0, sqrt(s.trap)); }
   return vec2<f32>(s.dr, s.di);
 }
 

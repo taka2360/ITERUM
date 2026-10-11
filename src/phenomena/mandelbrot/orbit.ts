@@ -74,6 +74,19 @@ export function decodePacket(buf: ArrayBuffer): DecodedPacket {
   };
 }
 
+/**
+ * The point the orbit was actually computed for: Rust holds the reference in
+ * fixed point with 64·⌈bits/64⌉ fractional bits and truncates (towards zero)
+ * any finer bits of the request (fixed.rs, Fixed::from_hex).
+ */
+export function orbitReference(o: { ref: DeepPoint; bits: number }): DeepPoint {
+  const frac = 64 * Math.ceil(o.bits / 64);
+  if (frac >= o.ref.frac) return o.ref;
+  const shift = BigInt(o.ref.frac - frac);
+  const trunc = (v: bigint) => (v < 0n ? -(-v >> shift) : v >> shift);
+  return { re: trunc(o.ref.re), im: trunc(o.ref.im), frac };
+}
+
 export const hasTauri = (): boolean => "__TAURI_INTERNALS__" in window;
 
 // A function, not a constant: GPUBufferUsage does not exist where WebGPU is absent (unit tests).

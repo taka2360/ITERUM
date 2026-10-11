@@ -12,13 +12,16 @@
 // Each view is rendered once at the comparison resolution (samples and the
 // per-pixel status and iteration count are saved), then once at the timing
 // resolution as warm-up, then ITERUM_RUNS times (default 5) for timing.
+// Experiments: ITERUM_CAP caps the iteration limit of every view,
+// ITERUM_PROVEN=0 disables the proven-interior tests, ITERUM_TRAP sets the
+// shading steps of proven pixels.
 
 import type { App } from "../main";
 import { DeepCamera } from "../core/camera2d";
 import { feFromLog2 } from "../core/floatexp";
 import { GpuTimer } from "../gpu/timing";
 import { EscapeEngine, MODE_DEEP, MODE_DIRECT, MODE_JULIA, MODE_PERTURB, MODE_NAMES, type EscapeView } from "../phenomena/escape/engine";
-import { OrbitManager, type OrbitInfo } from "../phenomena/mandelbrot/orbit";
+import { OrbitManager, orbitReference, type OrbitInfo } from "../phenomena/mandelbrot/orbit";
 import { VOYAGES } from "../phenomena/mandelbrot/voyages";
 import { diag, envVar, exitApp, saveFile } from "../platform";
 import { outDir, seconds } from "./harness";
@@ -86,6 +89,7 @@ export interface GoldenResult {
   escaped: number;
   interior: number;
   cycling: number;
+  proven: number;
   anomalies: number;
   orbitMs?: number;
   /** Loop steps executed (a BLA span counts once). */
@@ -112,6 +116,9 @@ async function orbitFor(orbits: OrbitManager, cam: DeepCamera, log2s: number, w:
 const sum = (os: OrbitInfo[], f: (o: OrbitInfo) => number) => +os.reduce((t, o) => t + f(o), 0).toFixed(1);
 
 /** Renders one view to convergence; returns the engine (caller disposes) and timings. */
+/** Experiment settings from the environment (see the header). */
+let experiment: (e: EscapeEngine) => void = () => {};
+
 export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManager, w = W, h = H, configure?: (e: EscapeEngine) => void): Promise<{ engine: EscapeEngine; result: GoldenResult }> {
   let view: EscapeView;
   let orbitMs: number | undefined;
@@ -125,13 +132,14 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
     orbitMs = await orbitFor(orbits, cam, log2s, w, h, gv.grow);
     const o = orbits.current!;
     const mode = log2s > -100 && o.minLog2Abs > -100 && o.dcMaxLog2 > -120 ? MODE_PERTURB : MODE_DEEP;
-    view = { mode, spacing: feFromLog2(log2s), center: [0, 0], cmr: [0, 0], juliaC: [0, 0], orbit: o };
+    view = { mode, spacing: feFromLog2(log2s), center: [0, 0], cmr: [0, 0], juliaC: [0, 0], orbit: o, interiorRef: orbitReference(o) };
   }
   const engine = new EscapeEngine(() => app.palette);
   engine.init(app.gpu);
   engine.minIter = engine.maxIter = 800;
   if (view.orbit && !gv.grow && !orbits.current!.periodic && !orbits.current!.escaped) engine.maxIterCap = ORBIT_ITER;
   if (gv.grow) engine.orbitExtends = true;
+  experiment(engine);
   configure?.(engine);
   const installed: OrbitInfo[] = view.orbit ? [orbits.current!] : [];
   const device = app.gpu.device;
@@ -187,6 +195,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
       escaped: s.escaped,
       interior: s.interior,
       cycling: s.cycling,
+      proven: s.proven,
       anomalies: s.anomalies,
       orbitMs: orbitMs !== undefined ? +orbitMs.toFixed(1) : undefined,
       steps: engine.stepsTotal,
@@ -226,6 +235,14 @@ export async function runGolden(app: App): Promise<void> {
   const results: (GoldenResult & { timing?: GoldenResult[] })[] = [];
   const timingOff = (await envVar("ITERUM_TIMING")) === "0";
   const runs = timingOff ? 0 : Number((await envVar("ITERUM_RUNS")) ?? TIMING_RUNS);
+  const cap = await envVar("ITERUM_CAP");
+  const proven = (await envVar("ITERUM_PROVEN")) !== "0";
+  const trap = await envVar("ITERUM_TRAP");
+  experiment = (e) => {
+    if (cap) e.maxIterCap = Math.min(e.maxIterCap, Number(cap));
+    e.provenInterior = proven;
+    if (trap) e.trapIters = Number(trap);
+  };
   for (const gv of GOLDEN_VIEWS.filter((v) => !only || only.split(",").includes(v.name))) {
     const { engine, result } = await renderGolden(app, gv, orbits);
     const samples = await engine.readSamples();
