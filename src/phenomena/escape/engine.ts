@@ -30,6 +30,15 @@ export interface GpuOrbit {
   blaOff: GPUBuffer;
   len: number;
   levels: number;
+  /**
+   * Id of an earlier orbit this one extends: same reference, precision and
+   * |δc| bound, so its points and BLA blocks over the earlier length are
+   * bit-identical. Switching to it keeps every pixel's state.
+   */
+  continues?: number;
+  /** The reference escaped or returned to 0: the orbit is complete. */
+  escaped?: boolean;
+  periodic?: boolean;
 }
 
 export interface EscapeView {
@@ -93,7 +102,7 @@ export interface EscapeStats {
 }
 
 const COUNTER_BYTES = 48;
-const PARAM_BYTES = 80;
+const PARAM_BYTES = 96;
 const DISPLAY_BYTES = 96;
 const STATE_BYTES = 48;
 // display.wgsl averages up to this many samples (unrolled); keep both in step.
@@ -140,6 +149,11 @@ export class EscapeEngine {
   private budget = 256;
   private framesSinceJob = 0;
 
+  /**
+   * A longer continuation of a truncated orbit will be supplied when needed
+   * (see GpuOrbit.continues): pixels reaching the orbit's end wait for it.
+   */
+  orbitExtends = false;
   /** Iteration limit; adapted from statistics unless pinned. */
   maxIter = 1000;
   minIter = 500;
@@ -283,7 +297,8 @@ export class EscapeEngine {
   setView(view: EscapeView, history: HistoryMap | null): void {
     const prev = this.view;
     this.view = view;
-    if (history || !prev || prev.mode !== view.mode || prev.orbit !== view.orbit) {
+    const extended = view.orbit?.continues !== undefined && view.orbit.continues === prev?.orbit?.id;
+    if (history || !prev || prev.mode !== view.mode || (prev.orbit !== view.orbit && !extended)) {
       this.hist = history ?? { scale: 1, offset: [0, 0] };
       this.newView();
       this.restart();
@@ -389,6 +404,8 @@ export class EscapeEngine {
         u[17] = view.orbit?.levels ?? 0;
         u[18] = this.sample;
         u[19] = this.maxIterCap;
+        const o = view.orbit;
+        u[20] = this.orbitExtends && o && !o.escaped && !o.periodic ? 1 : 0;
         device.queue.writeBuffer(this.params[step], 0, buf);
       }
       device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0]));

@@ -67,6 +67,8 @@ export class Mandelbrot implements Phenomenon {
   constructor(palette: () => PaletteTexture) {
     this.engine = new EscapeEngine(palette);
     this.engine.minIter = 800;
+    // manageOrbit() extends a truncated orbit whenever the limit outgrows it.
+    this.engine.orbitExtends = true;
     this.engine.maxIter = 800;
   }
 
@@ -338,7 +340,13 @@ export class Mandelbrot implements Phenomenon {
     const tooFar = !off || Math.hypot(off[0], off[1]) > halfDiag * 3;
     const tooShallow = !o || o.bits < needBits - 24;
     const tooShort = o !== undefined && !o.escaped && !o.periodic && o.maxIter < maxIter;
-    if (!o || tooFar || tooShallow || tooShort) {
+    if (o && tooShort && !tooFar && !tooShallow) {
+      // Same reference, longer: the GPU keeps computing with the current orbit
+      // (pixels rebase at its end) and switches without starting over.
+      orbits.request(o.ref, o.bits, Math.max(maxIter * 4, 4096), o.dcMaxLog2, o);
+      return;
+    }
+    if (!o || tooFar || tooShallow) {
       // New reference at the view centre, with headroom for further zoom.
       const dcMaxLog2 = spacingLog2 + Math.log2(halfDiag * 4);
       orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, needBits + 32, Math.max(maxIter * 2, 4096), dcMaxLog2);

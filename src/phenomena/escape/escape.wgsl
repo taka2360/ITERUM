@@ -15,7 +15,8 @@
 //
 // Status: 0 running, 1 escaped, 2 stopped at the iteration limit (not proven
 // interior; it resumes when the limit is raised, so its full state is kept),
-// 3 numeric anomaly, 4 proven interior (reserved). BLA spans may run past the
+// 3 numeric anomaly, 4 proven interior (reserved), 5 waiting at the end of a
+// truncated reference orbit for its extension (see orbit_wait). BLA spans may run past the
 // current limit (up to iter_cap), so the path a pixel takes never depends on
 // the limit: raising it and resuming equals starting with the higher limit.
 //
@@ -43,6 +44,12 @@ struct Params {
   bla_levels: u32,
   sample: u32,
   iter_cap: u32,         // hard iteration cap; BLA spans never depend on max_iter
+  // 1: the orbit is truncated and a longer one with the same prefix is coming.
+  // Rebasing at its end would replace δ by the full z (|z| ~ 1), losing the
+  // pixel's offset in f32, so pixels wait there instead and continue exactly
+  // when the extension arrives. 0: rebase at the end (complete orbits).
+  orbit_wait: u32,
+  _p0: u32, _p1: u32, _p2: u32,
 }
 
 struct PixelState {
@@ -260,6 +267,15 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
       return;
     }
+    if (m >= last && r2 >= dot(d, d) && P.orbit_wait != 0u) {
+      (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
+      (*s).rebases += rebases;
+      (*s).status = 5u;
+      atomicAdd(&counters.rebases, rebases);
+      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      atomicAdd(&counters.unfinished, 1u);
+      return;
+    }
     if (r2 < dot(d, d) || m >= last) {
       d = z;
       m = 0u;
@@ -346,7 +362,19 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
         return;
       }
     }
-    if (fe_less_pos(cf_norm2(z), cf_norm2(d)) || m >= last) {
+    let closer = fe_less_pos(cf_norm2(z), cf_norm2(d));
+    if (m >= last && !closer && P.orbit_wait != 0u) {
+      (*s).dr = d.v.x; (*s).di = d.v.y; (*s).de = d.e;
+      (*s).gr = g.v.x; (*s).gi = g.v.y; (*s).ge = g.e;
+      (*s).m = m; (*s).n = n;
+      (*s).rebases += rebases;
+      (*s).status = 5u;
+      atomicAdd(&counters.rebases, rebases);
+      if (skipped > 0u) { atomicAdd(&counters.bla_steps, skipped); }
+      atomicAdd(&counters.unfinished, 1u);
+      return;
+    }
+    if (closer || m >= last) {
       d = z;
       m = 0u;
       rebases++;
@@ -376,6 +404,18 @@ fn process(gid: vec3<u32>) -> u32 {
   if (s.job != P.job) { s = init_state(pix); }
   // Resume pixels stopped at an earlier, lower limit.
   if (s.status == 2u && s.n < P.max_iter) { s.status = 0u; }
+  // Waiting at the end of a truncated orbit: continue once it is longer (or
+  // no extension is coming).
+  if (s.status == 5u) {
+    if (s.m + 1u < P.orbit_len || P.orbit_wait == 0u) {
+      s.status = 0u;
+    } else {
+      atomicAdd(&counters.unfinished, 1u);
+      if (P.step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
+      if (P.step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
+      return 0u;
+    }
+  }
   if (s.status != 0u) { return 0u; }
   let n0 = s.n;
   if (MODE <= 1u) {
@@ -386,7 +426,7 @@ fn process(gid: vec3<u32>) -> u32 {
     iterate_deep(&s, pix, idx);
   }
   state[idx] = s;
-  if (s.status == 0u) {
+  if (s.status == 0u || s.status == 5u) {
     if (P.step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
     if (P.step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
   }

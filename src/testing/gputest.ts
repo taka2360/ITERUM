@@ -320,6 +320,63 @@ async function testModesAgree(app: App, orbits: OrbitManager): Promise<void> {
   b.engine.dispose();
 }
 
+// ---- orbit extension without restarting ------------------------------------------
+
+/**
+ * A view computed with a short orbit (pixels rebase at its end) that switches
+ * mid-way to the same orbit extended must keep its progress (no restart) and
+ * still agree with the arbitrary-precision oracle.
+ */
+async function testOrbitExtension(app: App, orbits: OrbitManager): Promise<void> {
+  const re = "-0.743643887037158704752191506114774";
+  const im = "0.131825904205311970493132056385139";
+  const log2s = Math.log2(1e-12) - Math.log2(W);
+  const cam = new DeepCamera(re, im, log2s);
+  const maxIter = 20000;
+  orbits.reset();
+  orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, Math.ceil(-log2s) + 84, 1024, log2s + Math.log2(W * 2));
+  while (!orbits.current) await seconds(0.02);
+  const short = orbits.current;
+  const engine = new EscapeEngine(() => app.palette);
+  engine.init(app.gpu);
+  engine.sampleTarget = 1;
+  engine.minIter = engine.maxIter = engine.maxIterCap = maxIter;
+  const timer = new GpuTimer(app.gpu.device, false);
+  const view: EscapeView = { mode: MODE_PERTURB, spacing: feFromLog2(log2s), center: [0, 0], cmr: [0, 0], juliaC: [0, 0], orbit: short };
+  const frame = async (v: EscapeView) => {
+    const encoder = app.gpu.device.createCommandEncoder();
+    engine.setView(v, null);
+    engine.render({ gpu: app.gpu, encoder, timer, time: 0, dt: 1 / 60, paused: false, palette: app.palette.palette, width: W, height: H, pixelRatio: 1 });
+    app.gpu.device.queue.submit([encoder.finish()]);
+    await app.gpu.device.queue.onSubmittedWorkDone();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  // Run until pixels are waiting at the end of the short orbit.
+  engine.orbitExtends = true;
+  for (let i = 0; i < 30; i++) await frame(view);
+  const waiting = Array.from((await engine.readState()).u).filter((v, i) => i % 12 === 9 && v === 5).length;
+  const jobBefore = engine.jobId;
+  orbits.request(short.ref, short.bits, maxIter * 4, short.dcMaxLog2, short);
+  while (orbits.current === short) await seconds(0.02);
+  const long = orbits.current!;
+  const extended = { ...view, orbit: long };
+  await frame(extended);
+  const kept = engine.jobId === jobBefore;
+  for (let i = 0; i < 2000 && engine.status !== "converged"; i++) await frame(extended);
+  const s = await engine.readState();
+  const refs = await oracle(cam, log2s, samplePixels(), maxIter);
+  const st = engine.stats();
+  // Control: the same view with the long orbit from the start.
+  const ctl = await renderView(app, { ...view, orbit: long }, maxIter, W, H, true);
+  compare("orbit-extension-control", ctl.f, ctl.u, samplePixels(), refs, "; long orbit from the start");
+  let same = 0;
+  for (let p = 0; p < W * H; p++) if (ctl.u[p * 12 + 9] === s.u[p * 12 + 9] && ctl.u[p * 12] === s.u[p * 12]) same++;
+  ctl.engine.dispose();
+  compare("orbit-extension", s.f, s.u, samplePixels(), refs, `; ${same}/${W * H} px bit-identical to the control; orbit ${short.len} → ${long.len}, continues ${long.continues === short.id}, progress kept ${kept}, ${waiting} px waited, rebases ${st.rebases}, anomalies ${st.anomalies}`);
+  if (!(kept && long.continues === short.id && waiting > 0) || st.anomalies > 0) report("orbit-extension-kept", false, `continues ${long.continues} (short ${short.id}), kept ${kept}, anomalies ${st.anomalies}`);
+  engine.dispose();
+}
+
 // ---- iteration limit: resuming equals starting high ----------------------------
 
 /**
@@ -540,6 +597,7 @@ export async function runGpuTests(app: App): Promise<void> {
   steps.push(["deep-1e-300", () => deepView(app, v("Seahorse Abyss").re, v("Seahorse Abyss").im, -v("Seahorse Abyss").depthLog2 + 2, "auto", 50000, "escape-floatexp-1e-300", orbits)]);
   steps.push(["modes", () => testModesAgree(app, orbits)]);
   steps.push(["extend", () => testExtendEquivalence(app, orbits)]);
+  steps.push(["orbit-extension", () => testOrbitExtension(app, orbits)]);
   steps.push(["controls", () => testControls(app)]);
   steps.push(["progress", () => testProgress(app)]);
   steps.push(["colour", () => testColourStability(app)]);
