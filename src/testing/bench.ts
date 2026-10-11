@@ -80,6 +80,10 @@ interface RunStats {
   passes: Record<string, number>;
   convergeS?: number;
   frames: number;
+  /** Sum of measured escape-pass GPU time during the measurement window. */
+  escapeGpuMs: number;
+  /** Phenomenon debug snapshot at the end of the run (mode, limit, orbit...). */
+  state?: Record<string, string>;
 }
 
 async function runOnce(app: App, sc: Scenario): Promise<RunStats> {
@@ -92,6 +96,7 @@ async function runOnce(app: App, sc: Scenario): Promise<RunStats> {
   const gpu: number[] = [];
   const passes = new Map<string, number[]>();
   let lastMeasured = app.timer.frames;
+  let escapeGpuMs = 0;
   let measuring = false;
   let last = t0;
   const prev = app.onFrame;
@@ -107,6 +112,7 @@ async function runOnce(app: App, sc: Scenario): Promise<RunStats> {
     if (app.timer.frames !== lastMeasured) {
       lastMeasured = app.timer.frames;
       gpu.push(app.timer.frameMs);
+      escapeGpuMs += app.timer.passMs.get("escape") ?? 0;
       for (const [k, v] of app.timer.passMs) {
         if (!passes.has(k)) passes.set(k, []);
         passes.get(k)!.push(v);
@@ -125,7 +131,8 @@ async function runOnce(app: App, sc: Scenario): Promise<RunStats> {
   app.onFrame = prev;
   const pass: Record<string, number> = {};
   for (const [k, v] of passes) pass[k] = pct(v, 0.5);
-  return { rafP50: pct(raf, 0.5), rafP95: pct(raf, 0.95), gpuP50: pct(gpu, 0.5), gpuP95: pct(gpu, 0.95), passes: pass, convergeS, frames: raf.length };
+  const state = app.phenomena[sc.phenomenon].debug?.();
+  return { rafP50: pct(raf, 0.5), rafP95: pct(raf, 0.95), gpuP50: pct(gpu, 0.5), gpuP95: pct(gpu, 0.95), passes: pass, convergeS, frames: raf.length, escapeGpuMs: +escapeGpuMs.toFixed(1), state };
 }
 
 async function deepAnalysis(app: App): Promise<Record<string, unknown>> {
@@ -218,6 +225,9 @@ export async function runBench(app: App): Promise<void> {
   const info = app.gpu.adapterInfo;
   const report: Record<string, unknown> = {
     date: new Date().toISOString(),
+    commit: (await envVar("ITERUM_COMMIT")) ?? "unknown",
+    // convergeS: seconds from setting the view until the engine reports
+    // "converged" (all samples finished, confirmed by the counter readback).
     adapter: { vendor: info.vendor, architecture: info.architecture, description: info.description, timestamps: app.gpu.hasTimestamps },
     resolution: RES,
     protocol: { warmupS: WARMUP_S, measureS: MEASURE_S, runs: RUNS },
@@ -237,6 +247,8 @@ export async function runBench(app: App): Promise<void> {
       convergeS: sc.converge ? agg("convergeS") : undefined,
       passesP50: runs[runs.length - 1].passes,
       frames: runs.map((x) => x.frames),
+      escapeGpuMs: runs.map((x) => x.escapeGpuMs),
+      state: runs[runs.length - 1].state,
     };
     (report.scenarios as Record<string, unknown>)[sc.name] = entry;
     const line = `${sc.name}: rAF p50 ${entry.rafP50.mean}±${entry.rafP50.sd} ms, p95 ${entry.rafP95.mean} ms | GPU p50 ${entry.gpuP50.mean}±${entry.gpuP50.sd} ms, p95 ${entry.gpuP95.mean} ms${entry.convergeS ? ` | converge ${entry.convergeS.mean}±${entry.convergeS.sd} s` : ""}`;

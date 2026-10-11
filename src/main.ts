@@ -338,6 +338,7 @@ async function main(): Promise<void> {
   if (mode === "gputest") (await import("./testing/gputest")).runGpuTests(app);
   if (mode === "shots") (await import("./testing/shots")).runShots(app);
   if (mode === "bench") (await import("./testing/bench")).runBench(app);
+  if (mode === "golden") (await import("./testing/golden")).runGolden(app);
 }
 
 main().catch((e) => {

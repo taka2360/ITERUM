@@ -153,6 +153,10 @@ export class EscapeEngine {
   private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1 };
   /** Aggregated statistics of the most recently completed sample. */
   lastComplete?: EscapeStats;
+  /** Iterations advanced since init (BLA spans counted in full); benchmarks. */
+  iterationsTotal = 0;
+  /** Times the iteration limit was raised (benchmarks). */
+  restarts = 0;
 
   constructor(private palette: () => PaletteTexture) {}
 
@@ -464,6 +468,7 @@ export class EscapeEngine {
     const now = performance.now();
     const pr = this.prog;
     pr.rate.push({ t: now, n: c[11] * 256 });
+    this.iterationsTotal += c[11] * 256;
     while (pr.rate.length > 2 && now - pr.rate[0].t > 1000) pr.rate.shift();
     pr.anyUnfinished = c[0];
     pr.anyCoarse = c[9];
@@ -493,6 +498,7 @@ export class EscapeEngine {
     if (this.sample === 0) {
       if (this.wantsMoreIterations()) {
         this.maxIter = Math.min(this.maxIterCap, this.maxIter * 2);
+        this.restarts++;
         this.prog.note = `反復上限を ${this.maxIter.toLocaleString()} に引き上げて再計算中`;
         this.restart();
         return;
