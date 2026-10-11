@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodePacket, HEADER_WORDS } from "../src/phenomena/mandelbrot/orbit";
+import { blaLevels, blaOffsets, decodePacket, HEADER_WORDS } from "../src/phenomena/mandelbrot/orbit";
 
 describe("orbit packet decoding", () => {
   it("reads the layout written by format.rs", () => {
@@ -22,5 +22,26 @@ describe("orbit packet decoding", () => {
 
   it("rejects foreign data", () => {
     expect(() => decodePacket(new ArrayBuffer(HEADER_WORDS * 4))).toThrow();
+  });
+});
+
+describe("BLA table layout", () => {
+  // As bla.rs builds it: level 0 has len − 2 entries, each level pairs the
+  // previous one (chunks_exact) while it has at least two; level 0 is not stored.
+  function reference(len: number): number[] {
+    if (len < 3) return [0];
+    const counts = [len - 2];
+    while (counts[counts.length - 1] >= 2) counts.push(Math.floor(counts[counts.length - 1] / 2));
+    const stored = counts.slice(1, 33);
+    const off = [0];
+    for (const c of stored) off.push(off[off.length - 1] + c);
+    return off;
+  }
+
+  it("matches the table built by bla.rs for every length", () => {
+    for (const len of [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100, 1025, 1026, 4097, 25601, 1 << 20, (1 << 24) + 1, (1 << 24) + 2]) {
+      expect([...blaOffsets(len)]).toEqual(reference(len));
+      expect(blaLevels(len)).toBe(reference(len).length - 1);
+    }
   });
 });

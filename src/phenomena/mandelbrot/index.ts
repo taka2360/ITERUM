@@ -138,6 +138,15 @@ export class Mandelbrot implements Phenomenon {
     this.glide = { re: cam.re, im: cam.im, frac: cam.frac };
   }
 
+  /**
+   * Orbit length to request: at least 4096, and never beyond what the
+   * iteration cap can use (one more than the cap, so that no pixel ever waits
+   * at the end of an orbit the limit cannot outgrow).
+   */
+  private orbitLength(want: number): number {
+    return Math.min(Math.max(want, 4096), this.engine.maxIterCap + 1);
+  }
+
   /** Places the view at an exact location (used by benchmarks and tests). */
   setView(re: string, im: string, log2Scale: number): void {
     this.needsHome = false;
@@ -351,13 +360,13 @@ export class Mandelbrot implements Phenomenon {
     if (o && tooShort && !tooFar && !tooShallow) {
       // Same reference, longer: the GPU keeps computing with the current orbit
       // (pixels rebase at its end) and switches without starting over.
-      orbits.request(o.ref, o.bits, Math.max(maxIter * 4, 4096), o.dcMaxLog2, o);
+      orbits.request(o.ref, o.bits, this.orbitLength(maxIter * 4), o.dcMaxLog2, o);
       return;
     }
     if (!o || tooFar || tooShallow) {
       // New reference at the view centre, with headroom for further zoom.
       const dcMaxLog2 = spacingLog2 + Math.log2(halfDiag * 4);
-      orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, needBits + 32, Math.max(maxIter * 2, 4096), dcMaxLog2);
+      orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, needBits + 32, this.orbitLength(maxIter * 2), dcMaxLog2);
       return;
     }
     // The BLA table is valid while |δc| stays below the bound it was built for;

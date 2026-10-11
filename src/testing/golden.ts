@@ -154,7 +154,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
         view = { ...view, orbit: o };
       }
       if (!orbits.busy && !o.escaped && !o.periodic && o.maxIter <= engine.maxIter) {
-        orbits.request(o.ref, o.bits, Math.max(engine.maxIter * 4, 4096), o.dcMaxLog2, o);
+        orbits.request(o.ref, o.bits, Math.min(Math.max(engine.maxIter * 4, 4096), engine.maxIterCap + 1), o.dcMaxLog2, o);
       }
     }
     const encoder = device.createCommandEncoder();
