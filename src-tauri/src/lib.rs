@@ -44,6 +44,7 @@ pub fn run() {
             deepzoom::reference_orbit,
             deepzoom::bla_table,
             deepzoom::cancel_orbit,
+            deepzoom::orbit_progress,
             deepzoom::direct_iterate,
             deepzoom::direct_batch
         ])

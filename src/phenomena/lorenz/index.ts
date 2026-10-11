@@ -3,7 +3,8 @@
 
 import { OrbitCamera } from "../../core/camera3d";
 import type { InputFrame } from "../../core/input";
-import type { FrameContext, Phenomenon, PhenomenonMeta } from "../../core/phenomenon";
+import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo } from "../../core/phenomenon";
+import { bigCount, int, percent } from "../../ui/format";
 import { hexToRgb, type PaletteTexture } from "../../core/palettes";
 import { shaderModule, type GpuContext } from "../../gpu/device";
 import { wgsl } from "../../shaders";
@@ -214,6 +215,14 @@ export class Lorenz implements Phenomenon {
     }
 
     const speed = Math.min(frame.dt * 60, 3);
+    this.paused = frame.paused;
+    if (!frame.paused) {
+      this.simTime += this.settings.dt * speed * steps;
+      const inst = (count * steps) / Math.max(frame.dt, 1e-3);
+      this.stepRate += (inst - this.stepRate) * 0.1;
+    } else {
+      this.stepRate = 0;
+    }
     this.writeUniforms(frame, steps, frame.paused ? 0 : this.settings.dt * speed, count, frame.paused ? 0 : frame.dt);
     const pal2 = pal.palette;
     const bg = hexToRgb(pal2.background);
@@ -243,6 +252,32 @@ export class Lorenz implements Phenomenon {
     dec.dispatchWorkgroups(Math.ceil((width * height * 3) / 256));
     dec.end();
     return { output: this.output, status: "refining" };
+  }
+
+  private simTime = 0;
+  private stepRate = 0;
+  private paused = false;
+
+  progress(): ProgressInfo {
+    const s = this.settings;
+    if (this.preroll > 0 || !this.seeded) {
+      const f = this.seeded ? 1 - this.preroll / 24 : 0;
+      return {
+        fraction: f,
+        headline: "準備中 — 粒子をアトラクタになじませています",
+        rows: [{ label: "準備", value: percent(f), bar: f }],
+      };
+    }
+    return {
+      headline: this.paused ? "停止中" : "流れに沿って毎フレーム積分しています",
+      rows: [
+        { label: "粒子", value: `${int(s.particles)} 個（先導粒子 56 と、その後を追う粒子）` },
+        { label: "積分", value: `RK4 · ${s.stepsPerFrame} ステップ/フレーム · Δt ${s.dt}` },
+        { label: "積分速度", value: `${bigCount(this.stepRate)} 粒子ステップ/秒` },
+        { label: "シミュレーション時間", value: `t = ${this.simTime.toFixed(1)}` },
+        { label: "残光", value: `1 フレームごとに ${(s.decay * 100).toFixed(0)}% に減衰` },
+      ],
+    };
   }
 
   debug(): Record<string, string> {

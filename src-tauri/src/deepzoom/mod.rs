@@ -26,6 +26,40 @@ pub struct DeepZoomState {
     latest: Arc<AtomicU32>,
     /// Last completed orbit, kept so the BLA table can be rebuilt for a new |δc| bound.
     cache: Mutex<Option<CachedOrbit>>,
+    /// Progress of the running computation (polled by the frontend).
+    progress: Arc<Mutex<Progress>>,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    pub id: u32,
+    /// "orbit", "bla", "encode" or "idle".
+    pub phase: &'static str,
+    pub iterations: u32,
+    pub max_iter: u32,
+    pub bits: u32,
+    pub elapsed_ms: f64,
+    #[serde(skip)]
+    started: Option<Instant>,
+}
+
+fn set_phase(p: &Mutex<Progress>, phase: &'static str) {
+    let mut g = p.lock().unwrap();
+    g.phase = phase;
+    if let Some(t) = g.started {
+        g.elapsed_ms = t.elapsed().as_secs_f64() * 1e3;
+    }
+}
+
+/// Progress of the current (or last) reference computation.
+#[tauri::command]
+pub fn orbit_progress(state: State<'_, DeepZoomState>) -> Progress {
+    let mut p = state.progress.lock().unwrap().clone();
+    if let (Some(t), false) = (p.started, p.phase == "idle") {
+        p.elapsed_ms = t.elapsed().as_secs_f64() * 1e3;
+    }
+    p
 }
 
 struct CachedOrbit {
@@ -61,12 +95,32 @@ pub async fn reference_orbit(state: State<'_, DeepZoomState>, req: OrbitRequest)
     let latest = state.latest.clone();
     let (cr, ci) = parse_center(&req.re, &req.im, req.frac_bits, req.bits)?;
     let id = req.id;
+    let progress = state.progress.clone();
+    *progress.lock().unwrap() = Progress {
+        id,
+        phase: "orbit",
+        iterations: 0,
+        max_iter: req.max_iter,
+        bits: req.bits,
+        elapsed_ms: 0.0,
+        started: Some(Instant::now()),
+    };
     let result = tauri::async_runtime::spawn_blocking(move || {
         let t0 = Instant::now();
-        let orbit = reference::compute(&cr, &ci, req.max_iter, &|| latest.load(Ordering::Relaxed) != id)?;
+        let orbit = reference::compute(&cr, &ci, req.max_iter, &|n| {
+            let mut p = progress.lock().unwrap();
+            if p.id == id {
+                p.iterations = n;
+            }
+            drop(p);
+            latest.load(Ordering::Relaxed) != id
+        })?;
         let t1 = Instant::now();
+        progress.lock().unwrap().iterations = orbit.z.len() as u32 - 1;
+        set_phase(&progress, "bla");
         let table = bla::build(&orbit.z, Fe::from_log2(req.dc_max_log2));
         let t2 = Instant::now();
+        set_phase(&progress, "encode");
         let bytes = format::encode(&format::Packet {
             id,
             orbit: &orbit.z,
@@ -87,6 +141,7 @@ pub async fn reference_orbit(state: State<'_, DeepZoomState>, req: OrbitRequest)
             (t2 - t1).as_secs_f64() * 1e3,
             bytes.len()
         );
+        set_phase(&progress, "idle");
         Some((bytes, orbit))
     })
     .await

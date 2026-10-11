@@ -13,6 +13,7 @@
     "test:gpu": "node scripts/mode.mjs gputest",
     "bench": "node scripts/mode.mjs bench",
     "shots": "node scripts/mode.mjs shots",
+    "golden": "node scripts/mode.mjs golden",
     "voyages": "cargo run --release --manifest-path src-tauri/Cargo.toml --example voyage_targets > src/phenomena/mandelbrot/voyages.ts",
     "tauri": "tauri"
   },

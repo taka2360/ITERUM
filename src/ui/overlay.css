@@ -178,6 +178,56 @@ body.hidden-ui #ui > * { opacity: 0 !important; }
 #help dt { color: var(--ink); text-align: right; font-family: var(--serif); }
 #help dd { margin: 0; color: var(--ink-soft); }
 
+#progress {
+  position: absolute;
+  top: 26px;
+  right: 30px;
+  width: min(380px, 80vw);
+  padding: 22px 24px 20px;
+  background: rgba(6, 7, 11, 0.66);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(236, 231, 220, 0.08);
+  font-family: var(--sans);
+  pointer-events: auto;
+}
+#progress .headline {
+  margin: 0 0 16px;
+  font-family: var(--serif);
+  font-weight: normal;
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  color: var(--ink);
+}
+#progress .row { margin-top: 11px; }
+#progress .label { font-size: 10px; letter-spacing: 0.16em; color: var(--ink-faint); }
+#progress .value {
+  margin-top: 3px;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+#progress .bar { margin-top: 6px; height: 2px; background: rgba(236, 231, 220, 0.08); }
+#progress .bar > div { height: 100%; background: rgba(236, 231, 220, 0.6); transition: width 0.25s linear; }
+
+#progressline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  opacity: 0;
+  transition: opacity 1.2s;
+}
+#progressline.show { opacity: 1; }
+#progressline .fill {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, rgba(236, 231, 220, 0.05), rgba(236, 231, 220, 0.45));
+  transition: width 0.3s linear;
+}
+#controls button.on { color: var(--ink); background: rgba(236, 231, 220, 0.09); }
+
 #debug {
   position: absolute;
   top: 56px;

@@ -70,9 +70,21 @@ function upload(device: GPUDevice, data: Uint8Array<ArrayBuffer>, label: string)
   return buffer;
 }
 
+export interface OrbitProgress {
+  id: number;
+  phase: "orbit" | "bla" | "encode" | "idle";
+  iterations: number;
+  maxIter: number;
+  bits: number;
+  elapsedMs: number;
+}
+
 export class OrbitManager {
   current?: OrbitInfo;
-  pending?: { id: number; bits: number; ref: DeepPoint; started: number; kind: "orbit" | "bla" };
+  /** Live progress of the pending computation (polled from Rust). */
+  progress?: OrbitProgress;
+  private poller = 0;
+  pending?: { id: number; bits: number; ref: DeepPoint; started: number; kind: "orbit" | "bla"; extend?: OrbitInfo };
   lastError?: string;
   private nextId = 1;
 
@@ -82,9 +94,19 @@ export class OrbitManager {
     return this.pending !== undefined;
   }
 
-  request(ref: DeepPoint, bits: number, maxIter: number, dcMaxLog2: number): void {
+  /**
+   * Requests a reference orbit. With `extend`, the request repeats that
+   * orbit's reference, precision and |δc| bound with a longer length, and the
+   * result is marked as its continuation (see GpuOrbit.continues).
+   */
+  request(ref: DeepPoint, bits: number, maxIter: number, dcMaxLog2: number, extend?: OrbitInfo): void {
     const id = this.nextId++;
-    this.pending = { id, bits, ref, started: performance.now(), kind: "orbit" };
+    if (extend) {
+      ref = extend.ref;
+      bits = extend.bits;
+      dcMaxLog2 = extend.dcMaxLog2;
+    }
+    this.pending = { id, bits, ref, started: performance.now(), kind: "orbit", extend };
     const req = {
       id,
       re: ref.re.toString(16),
@@ -94,11 +116,15 @@ export class OrbitManager {
       maxIter,
       dcMaxLog2,
     };
+    this.progress = { id, phase: "orbit", iterations: 0, maxIter, bits, elapsedMs: 0 };
+    this.startPolling();
     invoke<ArrayBuffer>("reference_orbit", { req })
       .then((buf) => {
         if (this.pending?.id !== id) return;
         const p = decodePacket(buf);
-        this.install(p, ref, maxIter, performance.now() - this.pending.started);
+        const ext = this.pending.extend;
+        const continues = ext && this.current === ext && p.len >= ext.len && p.bits === ext.bits && p.dcMaxLog2 === ext.dcMaxLog2 ? ext.id : undefined;
+        this.install(p, ref, maxIter, performance.now() - this.pending.started, continues);
         this.pending = undefined;
       })
       .catch((e) => {
@@ -107,6 +133,21 @@ export class OrbitManager {
           this.lastError = String(e);
         }
       });
+  }
+
+  private startPolling(): void {
+    clearInterval(this.poller);
+    this.poller = window.setInterval(() => {
+      if (!this.pending) {
+        clearInterval(this.poller);
+        return;
+      }
+      invoke<OrbitProgress>("orbit_progress")
+        .then((p) => {
+          if (this.pending && p.id === this.pending.id) this.progress = p;
+        })
+        .catch(() => {});
+    }, 200);
   }
 
   /** Rebuilds the BLA table of the current orbit for a new |δc| bound. */
@@ -130,7 +171,7 @@ export class OrbitManager {
       });
   }
 
-  private install(p: DecodedPacket, ref: DeepPoint, maxIter: number, ms: number): void {
+  private install(p: DecodedPacket, ref: DeepPoint, maxIter: number, ms: number, continues?: number): void {
     const old = this.current;
     this.current = {
       // Unique per upload: GPU bind groups are cached by this id.
@@ -141,6 +182,7 @@ export class OrbitManager {
       blaOff: upload(this.device, new Uint8Array(p.offsets.buffer), "bla-offsets"),
       len: p.len,
       levels: p.levels,
+      continues,
       ref,
       bits: p.bits,
       escaped: p.escaped,

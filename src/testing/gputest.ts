@@ -23,8 +23,9 @@ import { VOYAGES } from "../phenomena/mandelbrot/voyages";
 import { integrate } from "../phenomena/lorenz/reference";
 import lorenzSrc from "../phenomena/lorenz/lorenz.wgsl?raw";
 import floatexpTestSrc from "./floatexp_test.wgsl?raw";
-import { diag, exitApp } from "../platform";
+import { diag, envVar, exitApp } from "../platform";
 import { frames, seconds, shot } from "./harness";
+import { GOLDEN_VIEWS, renderGolden } from "./golden";
 
 interface Result {
   name: string;
@@ -319,6 +320,87 @@ async function testModesAgree(app: App, orbits: OrbitManager): Promise<void> {
   b.engine.dispose();
 }
 
+// ---- orbit extension without restarting ------------------------------------------
+
+/**
+ * A view computed with a short orbit (pixels rebase at its end) that switches
+ * mid-way to the same orbit extended must keep its progress (no restart) and
+ * still agree with the arbitrary-precision oracle.
+ */
+async function testOrbitExtension(app: App, orbits: OrbitManager): Promise<void> {
+  const re = "-0.743643887037158704752191506114774";
+  const im = "0.131825904205311970493132056385139";
+  const log2s = Math.log2(1e-12) - Math.log2(W);
+  const cam = new DeepCamera(re, im, log2s);
+  const maxIter = 20000;
+  orbits.reset();
+  orbits.request({ re: cam.re, im: cam.im, frac: cam.frac }, Math.ceil(-log2s) + 84, 1024, log2s + Math.log2(W * 2));
+  while (!orbits.current) await seconds(0.02);
+  const short = orbits.current;
+  const engine = new EscapeEngine(() => app.palette);
+  engine.init(app.gpu);
+  engine.sampleTarget = 1;
+  engine.minIter = engine.maxIter = engine.maxIterCap = maxIter;
+  const timer = new GpuTimer(app.gpu.device, false);
+  const view: EscapeView = { mode: MODE_PERTURB, spacing: feFromLog2(log2s), center: [0, 0], cmr: [0, 0], juliaC: [0, 0], orbit: short };
+  const frame = async (v: EscapeView) => {
+    const encoder = app.gpu.device.createCommandEncoder();
+    engine.setView(v, null);
+    engine.render({ gpu: app.gpu, encoder, timer, time: 0, dt: 1 / 60, paused: false, palette: app.palette.palette, width: W, height: H, pixelRatio: 1 });
+    app.gpu.device.queue.submit([encoder.finish()]);
+    await app.gpu.device.queue.onSubmittedWorkDone();
+    await new Promise((r) => setTimeout(r, 0));
+  };
+  // Run until pixels are waiting at the end of the short orbit.
+  engine.orbitExtends = true;
+  for (let i = 0; i < 30; i++) await frame(view);
+  const waiting = Array.from((await engine.readState()).u).filter((v, i) => i % 12 === 9 && v === 5).length;
+  const jobBefore = engine.jobId;
+  orbits.request(short.ref, short.bits, maxIter * 4, short.dcMaxLog2, short);
+  while (orbits.current === short) await seconds(0.02);
+  const long = orbits.current!;
+  const extended = { ...view, orbit: long };
+  await frame(extended);
+  const kept = engine.jobId === jobBefore;
+  for (let i = 0; i < 2000 && engine.status !== "converged"; i++) await frame(extended);
+  const s = await engine.readState();
+  const refs = await oracle(cam, log2s, samplePixels(), maxIter);
+  const st = engine.stats();
+  // Control: the same view with the long orbit from the start.
+  const ctl = await renderView(app, { ...view, orbit: long }, maxIter, W, H, true);
+  compare("orbit-extension-control", ctl.f, ctl.u, samplePixels(), refs, "; long orbit from the start");
+  let same = 0;
+  for (let p = 0; p < W * H; p++) if (ctl.u[p * 12 + 9] === s.u[p * 12 + 9] && ctl.u[p * 12] === s.u[p * 12]) same++;
+  ctl.engine.dispose();
+  compare("orbit-extension", s.f, s.u, samplePixels(), refs, `; ${same}/${W * H} px bit-identical to the control; orbit ${short.len} → ${long.len}, continues ${long.continues === short.id}, progress kept ${kept}, ${waiting} px waited, rebases ${st.rebases}, anomalies ${st.anomalies}`);
+  if (!(kept && long.continues === short.id && waiting > 0) || st.anomalies > 0) report("orbit-extension-kept", false, `continues ${long.continues} (short ${short.id}), kept ${kept}, anomalies ${st.anomalies}`);
+  engine.dispose();
+}
+
+// ---- iteration limit: resuming equals starting high ----------------------------
+
+/**
+ * A view whose limit is raised during computation (pixels resume from their
+ * state) must give bit-identical samples to the same view computed with the
+ * final limit from the start.
+ */
+async function testExtendEquivalence(app: App, orbits: OrbitManager): Promise<void> {
+  for (const name of ["seahorse-1e-2", "perturb-1e-15", "floatexp-1e-98"]) {
+    const gv = GOLDEN_VIEWS.find((v) => v.name === name)!;
+    const a = await renderGolden(app, gv, orbits);
+    const sa = new Uint32Array((await a.engine.readSamples()).buffer);
+    const limit = a.engine.maxIter;
+    a.engine.dispose();
+    const b = await renderGolden(app, gv, orbits, undefined, undefined, (e) => (e.minIter = e.maxIter = limit));
+    const sb = new Uint32Array((await b.engine.readSamples()).buffer);
+    b.engine.dispose();
+    let diff = 0;
+    for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) diff++;
+    report(`extend-${name}`, diff === 0 && a.result.restarts > 0 && b.result.restarts === 0,
+      `limit raised ${a.result.restarts}x to ${limit} vs ${limit} from the start: ${diff} of ${sa.length} sample words differ`);
+  }
+}
+
 // ---- device loss ------------------------------------------------------------
 
 async function meanLuma(png: Uint8Array): Promise<number> {
@@ -390,6 +472,116 @@ async function testControls(app: App): Promise<void> {
   report("controls", ok, notes.join("; "));
 }
 
+// ---- colour stability --------------------------------------------------------
+
+async function pixelsOf(png: Uint8Array): Promise<Uint8ClampedArray> {
+  const bmp = await createImageBitmap(new Blob([png as Uint8Array<ArrayBuffer>], { type: "image/png" }));
+  const c = new OffscreenCanvas(bmp.width, bmp.height);
+  const g = c.getContext("2d")!;
+  g.drawImage(bmp, 0, 0);
+  return g.getImageData(0, 0, bmp.width, bmp.height).data;
+}
+
+/** The image must not change colour when computation finishes (only edges refine). */
+async function testColourStability(app: App): Promise<void> {
+  app.select(0);
+  await seconds(2);
+  const m = app.phenomena[0] as import("../phenomena/mandelbrot").Mandelbrot;
+  const notes: string[] = [];
+  let ok = true;
+  const views: [string, string, number][] = [
+    ["-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", Math.log2(1e-12)],
+    [VOYAGES[2].re, VOYAGES[2].im, -VOYAGES[2].depthLog2 + 3],
+  ];
+  for (const [re, im, w] of views) {
+    m.setView(re, im, w - Math.log2(app.canvas.width));
+    let mid: Uint8ClampedArray | undefined;
+    const t0 = performance.now();
+    let lastStage = "";
+    const stageLog: string[] = [];
+    const meanOf = (d: Uint8ClampedArray) => {
+      let s = 0;
+      for (let i = 0; i < d.length; i += 4 * 31) s += d[i] + d[i + 1] + d[i + 2];
+      return (s / (d.length / (4 * 31)) / 3).toFixed(1);
+    };
+    while (performance.now() - t0 < 30000) {
+      await frames(app, 1);
+      const p = m.progress();
+      const e = p.rows.find((r) => r.label.startsWith("重ね描き"))?.value ?? "";
+      if (e !== lastStage) {
+        lastStage = e;
+        const img = await pixelsOf(await app.capture());
+        const look = (m as unknown as { engine: { look: { sMin: number }; maxIter: number } }).engine;
+        stageLog.push(`[${e.replace(" 枚目", "")} mean ${meanOf(img)} sMin ${look.look.sMin} maxIter ${look.maxIter}]`);
+        if (!mid && /^2 \//.test(e)) mid = img;
+      }
+      if (p.fraction === 1) break;
+    }
+    notes.push(stageLog.join(" "));
+    await frames(app, 5);
+    const fin = await pixelsOf(await app.capture());
+    if (!mid) {
+      ok = false;
+      notes.push("no midway capture");
+      continue;
+    }
+    const mean = (d: Uint8ClampedArray) => {
+      const s = [0, 0, 0];
+      for (let i = 0; i < d.length; i += 4 * 31) for (let c = 0; c < 3; c++) s[c] += d[i + c];
+      const n = d.length / (4 * 31);
+      return s.map((x) => x / n);
+    };
+    const a = mean(mid);
+    const b = mean(fin);
+    const shift = Math.max(...a.map((x, i) => Math.abs(x - b[i])));
+    if (shift > 3) ok = false;
+    notes.push(`mean RGB midway ${a.map((x) => x.toFixed(1)).join("/")} → final ${b.map((x) => x.toFixed(1)).join("/")} (max shift ${shift.toFixed(2)})`);
+  }
+  report("colour-stability", ok, notes.join("; "));
+}
+
+// ---- progress reporting --------------------------------------------------------
+
+async function testProgress(app: App): Promise<void> {
+  app.select(0);
+  await seconds(0.5);
+  const m = app.phenomena[0] as import("../phenomena/mandelbrot").Mandelbrot;
+  const v = VOYAGES.find((t) => t.name === "Abyssal Plain")!;
+  app.overlay.toggle("progress");
+  m.setView(v.re, v.im, -v.depthLog2 + 4 - Math.log2(app.canvas.width));
+  const seen = { minFraction: 1, orbitRow: false, rate: 0, headlines: new Set<string>(), finishS: NaN };
+  const t0 = performance.now();
+  let done = false;
+  while (performance.now() - t0 < 60000) {
+    await frames(app, 1);
+    const p = m.progress();
+    seen.minFraction = Math.min(seen.minFraction, p.fraction ?? 1);
+    seen.headlines.add(p.headline.split(" — ")[0]);
+    if (p.rows.some((r) => r.label.startsWith("基準軌道") && r.value.includes("bit"))) seen.orbitRow = true;
+    const rate = p.rows.find((r) => r.label === "処理速度");
+    if (rate) seen.rate = Math.max(seen.rate, parseFloat(rate.value));
+    if (p.fraction === 1 && p.headline.includes("完成")) {
+      const v = p.rows.find((r) => r.label === "完成までの時間")?.value ?? "";
+      seen.finishS = parseFloat(v) / (v.endsWith("ms") ? 1000 : 1);
+      done = true;
+      break;
+    }
+  }
+  await seconds(0.3);
+  const panelRows = document.querySelectorAll("#progress .row").length;
+  const panelHeadline = document.querySelector("#progress .headline")?.textContent ?? "";
+  app.overlay.toggle("progress");
+  // An image finished within the first 0.4 s is reported per frame ("moving"),
+  // so the bar may legitimately never show a partial fraction.
+  const sawPartial = seen.minFraction < 1 || seen.finishS < 0.5;
+  const ok = done && sawPartial && seen.orbitRow && seen.rate > 0 && panelRows >= 8;
+  report(
+    "progress",
+    ok,
+    `10^-1000 view: started at ${(seen.minFraction * 100).toFixed(0)}%, reached 完成 ${done} after ${seen.finishS} s, orbit row ${seen.orbitRow}, throughput seen ${seen.rate > 0}, panel rows ${panelRows} ("${panelHeadline}"), headlines: ${[...seen.headlines].join(" / ")}`,
+  );
+}
+
 export async function runGpuTests(app: App): Promise<void> {
   await seconds(1);
   const steps: [string, () => Promise<void>][] = [];
@@ -404,9 +596,14 @@ export async function runGpuTests(app: App): Promise<void> {
   steps.push(["deep-1e-98-wide", () => deepView(app, v("Elephant Valley").re, v("Elephant Valley").im, -v("Elephant Valley").depthLog2 + 6, "auto", 50000, "escape-floatexp-1e-98-surroundings", orbits)]);
   steps.push(["deep-1e-300", () => deepView(app, v("Seahorse Abyss").re, v("Seahorse Abyss").im, -v("Seahorse Abyss").depthLog2 + 2, "auto", 50000, "escape-floatexp-1e-300", orbits)]);
   steps.push(["modes", () => testModesAgree(app, orbits)]);
+  steps.push(["extend", () => testExtendEquivalence(app, orbits)]);
+  steps.push(["orbit-extension", () => testOrbitExtension(app, orbits)]);
   steps.push(["controls", () => testControls(app)]);
+  steps.push(["progress", () => testProgress(app)]);
+  steps.push(["colour", () => testColourStability(app)]);
   steps.push(["device-loss", () => testDeviceLoss(app)]);
-  for (const [name, fn] of steps) {
+  const only = await envVar("ITERUM_ONLY");
+  for (const [name, fn] of only ? steps.filter(([n]) => only.split(",").includes(n)) : steps) {
     try {
       await fn();
     } catch (e) {

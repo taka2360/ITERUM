@@ -30,6 +30,15 @@ export interface GpuOrbit {
   blaOff: GPUBuffer;
   len: number;
   levels: number;
+  /**
+   * Id of an earlier orbit this one extends: same reference, precision and
+   * |δc| bound, so its points and BLA blocks over the earlier length are
+   * bit-identical. Switching to it keeps every pixel's state.
+   */
+  continues?: number;
+  /** The reference escaped or returned to 0: the orbit is complete. */
+  escaped?: boolean;
+  periodic?: boolean;
 }
 
 export interface EscapeView {
@@ -50,6 +59,32 @@ export interface HistoryMap {
   offset: [number, number];
 }
 
+/** Detailed progress of the current view (see EscapeEngine.progress). */
+export interface EscapeProgress {
+  /** Completion of each progressive step of the current sample (0..1). */
+  coarse: number;
+  mid: number;
+  fine: number;
+  /** Completion of the current sample, and of the whole view (all samples). */
+  sample: number;
+  overall: number;
+  samplesDone: number;
+  sampleTarget: number;
+  converged: boolean;
+  /** The view changes every frame (dragging, zooming, Voyage): figures are per frame. */
+  moving: boolean;
+  /** Iterations advanced per second (BLA spans counted in full). */
+  iterationsPerSecond: number;
+  elapsedS: number;
+  /** Estimated seconds left, if the trend allows an estimate. */
+  etaS?: number;
+  maxIter: number;
+  maxEscaped: number;
+  /** Why the view was started over, if it was (e.g. iteration limit raised). */
+  note?: string;
+  pixels: number;
+}
+
 export interface EscapeStats {
   job: number;
   samplesDone: number;
@@ -57,6 +92,8 @@ export interface EscapeStats {
   unfinished: number;
   escaped: number;
   interior: number;
+  /** Interior pixels found cycling (subset of interior). */
+  cycling: number;
   anomalies: number;
   rebases: number;
   blaSteps: number;
@@ -66,10 +103,13 @@ export interface EscapeStats {
   maxIter: number;
 }
 
-const COUNTER_BYTES = 48;
-const PARAM_BYTES = 80;
+const COUNTER_BYTES = 52;
+// Largest per-pixel budget of a full-grid pass (list mode allows more).
+const FULL_BUDGET_MAX = 1 << 16;
+const PARAM_BYTES = 96;
 const DISPLAY_BYTES = 96;
 const STATE_BYTES = 48;
+// display.wgsl averages up to this many samples (unrolled); keep both in step.
 const MAX_SAMPLES = 4;
 
 // Jitter offsets for supersampling (first sample at the pixel centre).
@@ -85,6 +125,21 @@ export class EscapeEngine {
   private computeLayout!: GPUBindGroupLayout;
   private displayLayout!: GPUBindGroupLayout;
   private pipelines: GPUComputePipeline[] = [];
+  // Compaction (see escape.wgsl): per-mode list pipelines, the indirect-args
+  // pipeline, two index lists, their counts and the dispatch arguments.
+  private buildPipelines: GPUComputePipeline[] = [];
+  private listPipelines: GPUComputePipeline[] = [];
+  private argsPipeline!: GPUComputePipeline;
+  private argsLayout!: GPUBindGroupLayout;
+  private lists: GPUBuffer[] = [];
+  private listCtl!: GPUBuffer;
+  private listArgs!: GPUBuffer;
+  private listParams: GPUBuffer[] = [];
+  private listGroups: GPUBindGroup[] = [];
+  private argsGroups: GPUBindGroup[] = [];
+  private listMode = false;
+  private listBuild = false;
+  private listCur = 0;
   private displayPipeline!: GPURenderPipeline;
   private params: GPUBuffer[] = [];
   private displayParams!: GPUBuffer;
@@ -113,19 +168,40 @@ export class EscapeEngine {
   private budget = 256;
   private framesSinceJob = 0;
 
+  /**
+   * A longer continuation of a truncated orbit will be supplied when needed
+   * (see GpuOrbit.continues): pixels reaching the orbit's end wait for it.
+   */
+  orbitExtends = false;
   /** Iteration limit; adapted from statistics unless pinned. */
   maxIter = 1000;
   minIter = 500;
   maxIterCap = 1 << 24;
   sampleTarget = MAX_SAMPLES;
-  /** Target GPU milliseconds per frame for iteration. */
-  targetMs = 9;
+  /**
+   * Switch to dispatching only unfinished pixels (compaction) once fewer than
+   * this fraction of the pixels is still running; 0 disables it.
+   */
+  compactBelow = 0.25;
+  /**
+   * GPU time per frame for iteration, as a share of the measured frame
+   * interval: more while the view is still (only the image refines), less
+   * while it moves, and never above movingMaxMs then.
+   */
+  stillShare = 0.72;
+  movingShare = 0.55;
+  movingMaxMs = 9;
+  private frameMsAvg = 16.7;
   /** density: palette cycles per doubling of (iterations − sMin)/bandScale. */
   look = { offset: 0, density: 0.32, glow: 0.6, sMin: 0, bandScale: 6, interiorGlow: 0.3 };
 
-  private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1 };
+  private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0 };
   /** Aggregated statistics of the most recently completed sample. */
   lastComplete?: EscapeStats;
+  /** Iterations advanced since init (BLA spans counted in full); benchmarks. */
+  iterationsTotal = 0;
+  /** Times the iteration limit was raised (benchmarks). */
+  restarts = 0;
 
   constructor(private palette: () => PaletteTexture) {}
 
@@ -146,12 +222,42 @@ export class EscapeEngine {
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: ro },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: ro },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+      ],
+    });
+    this.argsLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: rw },
       ],
     });
     const module = shaderModule(device, "escape", wgsl(escapeSrc));
     const layout = device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
-    this.pipelines = [0, 1, 2, 3].map((mode) =>
-      device.createComputePipeline({ label: `escape-${mode}`, layout, compute: { module, entryPoint: "iterate", constants: { MODE: mode } } }),
+    const pipe = (entryPoint: string, mode: number) =>
+      device.createComputePipeline({ label: `escape-${entryPoint}-${mode}`, layout, compute: { module, entryPoint, constants: { MODE: mode } } });
+    this.pipelines = [0, 1, 2, 3].map((mode) => pipe("iterate", mode));
+    this.listPipelines = [0, 1, 2, 3].map((mode) => pipe("iterate_list", mode));
+    this.buildPipelines = [0, 1, 2, 3].map((mode) => pipe("build_list", mode));
+    this.argsPipeline = device.createComputePipeline({
+      label: "escape-list-args",
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.argsLayout] }),
+      compute: { module, entryPoint: "list_args" },
+    });
+    this.listCtl = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.listArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT });
+    this.listParams = [0, 1].map(() => device.createBuffer({ size: PARAM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+    this.argsGroups = this.listParams.map((p) =>
+      device.createBindGroup({
+        layout: this.argsLayout,
+        entries: [
+          { binding: 0, resource: { buffer: p } },
+          { binding: 9, resource: { buffer: this.listCtl } },
+          { binding: 10, resource: { buffer: this.listArgs } },
+        ],
+      }),
     );
     this.displayLayout = device.createBindGroupLayout({
       entries: [
@@ -190,9 +296,11 @@ export class EscapeEngine {
     this.state?.destroy();
     this.samples?.destroy();
     for (const t of this.outputs) t.destroy();
+    for (const l of this.lists) l.destroy();
     const device = this.device;
+    this.lists = [0, 1].map(() => device.createBuffer({ size: Math.max(64, w * h * 4), usage: GPUBufferUsage.STORAGE }));
     this.state = device.createBuffer({ size: Math.max(64, w * h * STATE_BYTES), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    this.samples = device.createBuffer({ size: Math.max(64, w * h * 8 * MAX_SAMPLES), usage: GPUBufferUsage.STORAGE });
+    this.samples = device.createBuffer({ size: Math.max(64, w * h * 8 * MAX_SAMPLES), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     this.outputs = [0, 1].map(() =>
       device.createTexture({
         size: [w, h],
@@ -206,18 +314,44 @@ export class EscapeEngine {
     this.restart();
   }
 
+  private prog = {
+    viewStart: performance.now(),
+    finishedAt: 0,
+    coarse: -1,
+    mid: -1,
+    rate: [] as { t: number; n: number }[],
+    trend: [] as { t: number; f: number }[],
+    note: undefined as string | undefined,
+    sMinLocked: false,
+    anyUnfinished: -1,
+    anyCoarse: -1,
+    anyMid: -1,
+  };
+
+  private newView(): void {
+    this.prog.sMinLocked = false;
+    this.prog.viewStart = performance.now();
+    this.prog.finishedAt = 0;
+    this.prog.note = undefined;
+    this.prog.trend = [];
+  }
+
   /** Starts the view over (e.g. after the iteration limit changed). */
   restart(): void {
+    this.prog.coarse = this.prog.mid = -1;
+    this.prog.finishedAt = 0;
+    this.prog.trend = [];
     this.job++;
     this.sample = 0;
     this.samplesDone = 0;
     this.converged = false;
     this.framesSinceJob = 0;
+    this.leaveListMode();
     this.resetAgg();
   }
 
   private resetAgg(): void {
-    this.agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1 };
+    this.agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0 };
   }
 
   /**
@@ -227,8 +361,10 @@ export class EscapeEngine {
   setView(view: EscapeView, history: HistoryMap | null): void {
     const prev = this.view;
     this.view = view;
-    if (history || !prev || prev.mode !== view.mode || prev.orbit !== view.orbit) {
+    const extended = view.orbit?.continues !== undefined && view.orbit.continues === prev?.orbit?.id;
+    if (history || !prev || prev.mode !== view.mode || (prev.orbit !== view.orbit && !extended)) {
       this.hist = history ?? { scale: 1, offset: [0, 0] };
+      this.newView();
       this.restart();
     } else {
       this.hist = { scale: 1, offset: [0, 0] };
@@ -247,6 +383,7 @@ export class EscapeEngine {
       unfinished: this.agg.unfinished,
       escaped: this.agg.escaped,
       interior: this.agg.interior,
+      cycling: this.agg.cycling,
       anomalies: this.agg.anomalies,
       rebases: this.agg.rebases,
       blaSteps: this.agg.blaSteps,
@@ -261,7 +398,7 @@ export class EscapeEngine {
     const key = `${this.width}x${this.height}:${orbit?.id ?? "none"}`;
     if (key === this.computeGroupKey) return this.computeGroups;
     this.computeGroupKey = key;
-    this.computeGroups = this.params.map((p) =>
+    const group = (p: GPUBuffer) =>
       this.device.createBindGroup({
         layout: this.computeLayout,
         entries: [
@@ -272,9 +409,13 @@ export class EscapeEngine {
           { binding: 4, resource: { buffer: orbit?.orbit ?? this.dummy } },
           { binding: 5, resource: { buffer: orbit?.bla ?? this.dummy } },
           { binding: 6, resource: { buffer: orbit?.blaOff ?? this.dummy } },
+          { binding: 7, resource: { buffer: this.lists[0] } },
+          { binding: 8, resource: { buffer: this.lists[1] } },
+          { binding: 9, resource: { buffer: this.listCtl } },
         ],
-      }),
-    );
+      });
+    this.computeGroups = this.params.map(group);
+    this.listGroups = this.listParams.map(group);
     return this.computeGroups;
   }
 
@@ -314,7 +455,7 @@ export class EscapeEngine {
       this.framesSinceJob++;
       const groups = this.computeGroupsFor(view.orbit);
       const jit = JITTER[this.sample % JITTER.length];
-      for (let step = 0; step < 3; step++) {
+      const writeParams = (target: GPUBuffer, step: number, listIn: number) => {
         const buf = new ArrayBuffer(PARAM_BYTES);
         const u = new Uint32Array(buf);
         const f = new Float32Array(buf);
@@ -326,22 +467,56 @@ export class EscapeEngine {
         f[10] = view.juliaC[0]; f[11] = view.juliaC[1];
         f[12] = view.spacing.m; i[13] = view.spacing.e;
         u[14] = this.maxIter;
-        // Coarse steps cover fewer pixels, so they get a larger share.
-        u[15] = Math.max(16, Math.round(this.budget * [4, 2, 1][step]));
+        // Budget of the finest step; the shader gives coarser steps (fewer
+        // pixels) 2× and 4× as much.
+        u[15] = Math.max(16, Math.round(this.budget));
         u[16] = view.orbit?.len ?? 0;
         u[17] = view.orbit?.levels ?? 0;
         u[18] = this.sample;
-        device.queue.writeBuffer(this.params[step], 0, buf);
+        const o = view.orbit;
+        u[20] = this.orbitExtends && o && !o.escaped && !o.periodic ? 1 : 0;
+        u[19] = listIn;
+        device.queue.writeBuffer(target, 0, buf);
+      };
+      device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0, 0]));
+      if (!this.listMode) {
+        for (let step = 0; step < 3; step++) writeParams(this.params[step], step, 0);
+        const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
+        pass.setPipeline(this.pipelines[view.mode]);
+        for (let step = 0; step < 3; step++) {
+          const stride = 1 << (2 - step);
+          pass.setBindGroup(0, groups[step]);
+          pass.dispatchWorkgroups(Math.ceil(Math.ceil(w / stride) / 8), Math.ceil(Math.ceil(h / stride) / 8));
+        }
+        pass.end();
+      } else {
+        // listGroups[k] reads list k and appends survivors to list 1 − k.
+        const cur = this.listCur;
+        const other = 1 - cur;
+        writeParams(this.listParams[0], 2, 0);
+        writeParams(this.listParams[1], 2, 1);
+        if (this.listBuild) {
+          this.listBuild = false;
+          enc.clearBuffer(this.listCtl, cur * 4, 4);
+          const groupsTotal = Math.ceil((w * h) / 64);
+          const x = Math.min(groupsTotal, 32768);
+          const pass = enc.beginComputePass({ label: "escape-build", timestampWrites: frame.timer.writes("escape") });
+          pass.setPipeline(this.buildPipelines[view.mode]);
+          pass.setBindGroup(0, this.listGroups[cur]);
+          pass.dispatchWorkgroups(x, Math.ceil(groupsTotal / x));
+          pass.end();
+        }
+        enc.clearBuffer(this.listCtl, other * 4, 4);
+        const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
+        pass.setPipeline(this.argsPipeline);
+        pass.setBindGroup(0, this.argsGroups[cur]);
+        pass.dispatchWorkgroups(1);
+        pass.setPipeline(this.listPipelines[view.mode]);
+        pass.setBindGroup(0, this.listGroups[cur]);
+        pass.dispatchWorkgroupsIndirect(this.listArgs, cur * 16);
+        pass.end();
+        this.listCur = other;
       }
-      device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0]));
-      const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
-      pass.setPipeline(this.pipelines[view.mode]);
-      for (let step = 0; step < 3; step++) {
-        const stride = 1 << (2 - step);
-        pass.setBindGroup(0, groups[step]);
-        pass.dispatchWorkgroups(Math.ceil(Math.ceil(w / stride) / 8), Math.ceil(Math.ceil(h / stride) / 8));
-      }
-      pass.end();
       this.scheduleReadback(enc);
     }
 
@@ -377,11 +552,21 @@ export class EscapeEngine {
   }
 
   private adaptBudget(frame: FrameContext): void {
+    if (frame.dt > 0) this.frameMsAvg += (Math.min(frame.dt * 1000, 50) - this.frameMsAvg) * 0.1;
     const ms = frame.timer.passMs.get("escape");
     if (ms === undefined || this.converged) return;
+    const still = performance.now() - this.prog.viewStart > 300;
+    const target = still ? this.frameMsAvg * this.stillShare : Math.min(this.movingMaxMs, this.frameMsAvg * this.movingShare);
     // Multiplicative controller towards the target; clamp per-frame change.
-    const ratio = Math.max(0.5, Math.min(1.5, this.targetMs / Math.max(ms, 0.05)));
-    this.budget = Math.max(32, Math.min(1 << 16, this.budget * ratio));
+    // Few pixels remain in list mode, so each may take a much larger share.
+    const ratio = Math.max(0.5, Math.min(1.5, target / Math.max(ms, 0.05)));
+    this.budget = Math.max(32, Math.min(this.listMode ? 1 << 22 : FULL_BUDGET_MAX, this.budget * ratio));
+  }
+
+  /** Back to full-grid passes: never start those with a list-mode budget. */
+  private leaveListMode(): void {
+    this.listMode = false;
+    this.budget = Math.min(this.budget, FULL_BUDGET_MAX);
   }
 
   private scheduleReadback(enc: GPUCommandEncoder): void {
@@ -391,6 +576,7 @@ export class EscapeEngine {
     rb.busy = true;
     const job = this.job;
     const sample = this.sample;
+    const maxIter = this.maxIter;
     queueMicrotask(() => {
       // mapAsync must be issued after submit; the frame loop submits synchronously
       // after render() returns, and microtasks run after the current task.
@@ -400,44 +586,89 @@ export class EscapeEngine {
           const c = new Uint32Array(rb.buffer.getMappedRange().slice(0));
           rb.buffer.unmap();
           rb.busy = false;
-          this.onCounters(job, sample, c);
+          this.onCounters(job, sample, maxIter, c);
         })
         .catch(() => (rb.busy = false));
     });
   }
 
-  private onCounters(job: number, sample: number, c: Uint32Array): void {
-    if (job !== this.job || sample !== this.sample) return;
+  private onCounters(job: number, sample: number, maxIter: number, c: Uint32Array): void {
+    // Throughput counts all work, including frames of superseded jobs.
+    const now = performance.now();
+    const pr = this.prog;
+    pr.rate.push({ t: now, n: c[11] * 256 });
+    this.iterationsTotal += c[11] * 256;
+    while (pr.rate.length > 2 && now - pr.rate[0].t > 1000) pr.rate.shift();
+    pr.anyUnfinished = c[0];
+    pr.anyCoarse = c[9];
+    pr.anyMid = c[10];
+    // Frames recorded before the limit was raised belong to the old limit.
+    if (job !== this.job || sample !== this.sample || maxIter !== this.maxIter) return;
+    pr.coarse = c[9];
+    pr.mid = c[10];
     const a = this.agg;
+    if (c[6] !== 0xffffffff) a.minN = Math.min(a.minN, c[6]);
+    // Fix the colour reference (fastest escape) while the coarse preview is
+    // still being drawn, so colours never shift when the image completes.
+    if (this.sample === 0 && !pr.sMinLocked && a.minN !== Infinity) {
+      this.look.sMin = a.minN;
+      if (c[9] === 0) pr.sMinLocked = true;
+    }
     a.unfinished = c[0];
     a.escaped += c[1];
     a.interior += c[2];
     a.anomalies += c[3];
     a.rebases += c[4];
     a.maxN = Math.max(a.maxN, c[5]);
-    if (c[6] !== 0xffffffff) a.minN = Math.min(a.minN, c[6]);
     a.blaSteps += c[7];
     a.late += c[8];
+    a.cycling += c[12];
+    // Few pixels left: from now on dispatch only those.
+    if (c[0] !== 0 && !this.listMode && c[0] < this.width * this.height * this.compactBelow) {
+      this.listMode = true;
+      this.listBuild = true;
+    }
     if (c[0] !== 0) return;
     // Sample complete.
     this.lastComplete = this.stats();
     if (this.sample === 0) {
-      if (a.minN !== Infinity) this.look.sMin = a.minN;
       if (this.wantsMoreIterations()) {
-        this.maxIter = Math.min(this.maxIterCap, this.maxIter * 2);
-        this.restart();
+        this.extendIterations();
         return;
       }
     }
     this.samplesDone++;
     if (this.samplesDone >= this.sampleTarget) {
       this.converged = true;
+      this.prog.finishedAt = performance.now();
+      this.prog.note = undefined;
       return;
     }
     this.sample = this.samplesDone;
     this.job++;
     this.framesSinceJob = 0;
+    this.leaveListMode();
     this.resetAgg();
+  }
+
+  /**
+   * Doubles the iteration limit; pixels stopped at the old limit continue from
+   * where they are and finished pixels keep their results.
+   */
+  private extendIterations(): void {
+    this.maxIter = Math.min(this.maxIterCap, this.maxIter * 2);
+    this.restarts++;
+    this.prog.note = `反復上限を ${this.maxIter.toLocaleString()} に引き上げて計算を継続中`;
+    // Escapes so far are below the old limit, so not "late" for the new one;
+    // pixels at the old limit are counted again when they stop or escape.
+    // Cycling pixels stay interior (they would stop at every limit).
+    this.agg.interior = this.agg.cycling;
+    // Pixels at the old limit are not in the list: rebuild it. Many may
+    // rejoin at once, so start again from a full-grid budget.
+    if (this.listMode) this.listBuild = true;
+    this.budget = Math.min(this.budget, FULL_BUDGET_MAX);
+    this.agg.late = 0;
+    this.agg.unfinished = -1;
   }
 
   /**
@@ -452,6 +683,60 @@ export class EscapeEngine {
     // but not forever: a view entirely inside the set stops at 2^17.
     if (a.escaped === 0) return this.maxIter < 1 << 17;
     return a.late > Math.max(16, a.escaped * 0.002);
+  }
+
+  progress(): EscapeProgress {
+    const w = this.width;
+    const h = this.height;
+    const pixels = w * h;
+    const half = Math.ceil(w / 2) * Math.ceil(h / 2);
+    const nCoarse = Math.ceil(w / 4) * Math.ceil(h / 4);
+    const nMid = half - nCoarse;
+    const nFine = pixels - half;
+    const pr = this.prog;
+    const a = this.agg;
+    const now = performance.now();
+    let known = a.unfinished >= 0 && pr.coarse >= 0;
+    let [left, leftCoarse, leftMid] = [a.unfinished, pr.coarse, pr.mid];
+    // While the view keeps changing, readbacks always belong to an earlier
+    // frame's view; report those per-frame figures instead of a stuck 0%.
+    const moving = !known && !this.converged && now - pr.viewStart < 400 && pr.anyUnfinished >= 0;
+    if (moving) {
+      known = true;
+      [left, leftCoarse, leftMid] = [pr.anyUnfinished, pr.anyCoarse, pr.anyMid];
+    }
+    const frac = (l: number, n: number) => (n > 0 ? 1 - Math.min(Math.max(l, 0), n) / n : 1);
+    const coarse = this.converged ? 1 : known ? frac(leftCoarse, nCoarse) : 0;
+    const mid = this.converged ? 1 : known ? frac(leftMid, nMid) : 0;
+    const fine = this.converged ? 1 : known ? frac(left - leftCoarse - leftMid, nFine) : 0;
+    const sample = this.converged ? 1 : known ? frac(left, pixels) : 0;
+    const overall = this.converged ? 1 : Math.min(1, (this.samplesDone + sample) / this.sampleTarget);
+    const rate =
+      pr.rate.length > 1 && !this.converged
+        ? pr.rate.slice(1).reduce((s, r) => s + r.n, 0) / Math.max(1e-3, (pr.rate[pr.rate.length - 1].t - pr.rate[0].t) / 1000)
+        : 0;
+    // ETA from the trend of overall completion over the last few seconds.
+    pr.trend.push({ t: now, f: overall });
+    while (pr.trend.length > 2 && now - pr.trend[0].t > 3000) pr.trend.shift();
+    let etaS: number | undefined;
+    const first = pr.trend[0];
+    if (!this.converged && first && now - first.t > 500 && overall > first.f) {
+      etaS = ((1 - overall) * (now - first.t)) / (overall - first.f) / 1000;
+    }
+    return {
+      coarse, mid, fine, sample, overall,
+      samplesDone: this.samplesDone,
+      sampleTarget: this.sampleTarget,
+      converged: this.converged,
+      moving,
+      iterationsPerSecond: rate,
+      elapsedS: ((this.converged ? pr.finishedAt : now) - pr.viewStart) / 1000,
+      etaS,
+      maxIter: this.maxIter,
+      maxEscaped: a.maxN,
+      note: pr.note,
+      pixels,
+    };
   }
 
   /** Lowers the iteration limit after zooming out (called on view changes). */
@@ -476,6 +761,20 @@ export class EscapeEngine {
     return { f: new Float32Array(copy), u: new Uint32Array(copy), width: this.width, height: this.height };
   }
 
+  /** Copies the finished samples to the CPU (tests only). */
+  async readSamples(): Promise<Float32Array> {
+    const size = this.width * this.height * 8 * MAX_SAMPLES;
+    const staging = this.device.createBuffer({ size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = this.device.createCommandEncoder();
+    enc.copyBufferToBuffer(this.samples!, 0, staging, 0, size);
+    this.device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    return out;
+  }
+
   /** Current job id (tests use it to know which pixels belong to the view). */
   get jobId(): number {
     return this.job;
@@ -486,6 +785,9 @@ export class EscapeEngine {
     this.samples?.destroy();
     for (const t of this.outputs) t.destroy();
     this.counters?.destroy();
+    for (const l of this.lists) l.destroy();
+    this.listCtl?.destroy();
+    this.listArgs?.destroy();
     for (const r of this.readbacks) r.buffer.destroy();
   }
 }

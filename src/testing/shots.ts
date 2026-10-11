@@ -40,6 +40,7 @@ export const SCENES: Scene[] = [
   { name: "12-voyage-20s", phenomenon: 0, setup: (app) => { app.phenomena[0].reset(); setTimeout(() => (app.phenomena[0] as Mandelbrot).toggleVoyage(2), 1500); }, wait: 20 },
   { name: "13-voyage-60s", phenomenon: 0, wait: 40 },
   { name: "14-voyage-120s", phenomenon: 0, wait: 60 },
+  { name: "15-progress-panel", phenomenon: 0, setup: (app) => { app.overlay.toggle("progress"); (app.phenomena[0] as Mandelbrot).toggleVoyage(3); }, wait: 40 },
   { name: "05-julia", phenomenon: 1, wait: 4 },
   { name: "06-newton", phenomenon: 2, wait: 3 },
   { name: "07-lorenz", phenomenon: 3, wait: 6 },

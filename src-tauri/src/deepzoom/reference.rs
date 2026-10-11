@@ -1,7 +1,7 @@
 //! High-precision Mandelbrot reference orbits.
 
 use super::fexp::CFe;
-use super::fixed::Fixed;
+use super::fixed::{kernel, Fixed};
 
 /// Escape radius used for both reference orbits and pixels (large for smooth colouring).
 pub const BAILOUT: f64 = 256.0;
@@ -23,17 +23,27 @@ pub fn limbs_for_bits(bits: u32) -> usize {
     (bits as usize).div_ceil(64) + 1
 }
 
-/// Iterates Z_{n+1} = Z_n^2 + c in fixed point. `cancelled` is polled
-/// periodically; returns `None` if it reports true.
+/// Iterates Z_{n+1} = Z_n^2 + c in fixed point. `poll` is called every 4096
+/// iterations with the iteration count (progress reporting) and returns true
+/// to cancel, in which case the result is `None`.
 pub fn compute(
     cr: &Fixed,
     ci: &Fixed,
     max_iter: u32,
-    cancelled: &dyn Fn() -> bool,
+    poll: &dyn Fn(u32) -> bool,
 ) -> Option<Orbit> {
     let limbs = cr.mag.len();
-    let mut zr = Fixed::zero(limbs);
-    let mut zi = Fixed::zero(limbs);
+    // Signed fixed-point values as (negative, limbs), updated in place by the
+    // allocation-free kernels (bit-identical to the `Fixed` methods).
+    let (mut zr_neg, mut zi_neg) = (false, false);
+    let mut zr = vec![0u64; limbs];
+    let mut zi = vec![0u64; limbs];
+    let mut zr2 = vec![0u64; limbs];
+    let mut zi2 = vec![0u64; limbs];
+    let mut s = vec![0u64; limbs];
+    let mut t = vec![0u64; limbs];
+    let mut u = vec![0u64; limbs];
+    let mut acc = vec![0u64; 2 * limbs + 1];
     let mut z = Vec::with_capacity((max_iter as usize + 1).min(1 << 24));
     z.push(CFe::ZERO);
     let mut escaped = false;
@@ -43,23 +53,29 @@ pub fn compute(
     // |Z| below this is zero at the working precision.
     let zero_log2 = -(64.0 * (limbs as f64 - 1.0)) + 48.0;
     for n in 0..max_iter {
-        if n & 0xfff == 0 && cancelled() {
+        if n & 0xfff == 0 && poll(n) {
             return None;
         }
-        let zr2 = zr.sqr();
-        let zi2 = zi.sqr();
-        let s = zr.add(&zi).sqr();
-        zi = s.sub(&zr2).sub(&zi2).add(ci);
-        zr = zr2.sub(&zi2).add(cr);
-        let v = CFe::from_parts(zr.to_fe(), zi.to_fe());
+        // Im: (zr + zi)² − zr² − zi² + ci;  Re: zr² − zi² + cr.
+        kernel::sqr_into(&zr, &mut acc, &mut zr2);
+        kernel::sqr_into(&zi, &mut acc, &mut zi2);
+        kernel::add_into(zr_neg, &zr, zi_neg, &zi, &mut t);
+        kernel::sqr_into(&t, &mut acc, &mut s);
+        let t_neg = kernel::add_into(false, &s, true, &zr2, &mut t);
+        let u_neg = kernel::add_into(t_neg, &t, true, &zi2, &mut u);
+        zi_neg = kernel::add_into(u_neg, &u, ci.neg, &ci.mag, &mut zi);
+        let t_neg = kernel::add_into(false, &zr2, true, &zi2, &mut t);
+        zr_neg = kernel::add_into(t_neg, &t, cr.neg, &cr.mag, &mut zr);
+        let v = CFe::from_parts(kernel::to_fe(zr_neg, &zr), kernel::to_fe(zi_neg, &zi));
         z.push(v);
         let n2 = v.norm2();
-        min_log2_abs = min_log2_abs.min(n2.log2() * 0.5);
+        let half_log2 = n2.log2() * 0.5;
+        min_log2_abs = min_log2_abs.min(half_log2);
         if n2.to_f64() > bail2 {
             escaped = true;
             break;
         }
-        if n2.log2() * 0.5 < zero_log2 {
+        if half_log2 < zero_log2 {
             periodic = true;
             break;
         }
@@ -76,7 +92,7 @@ pub struct DirectResult {
 }
 
 pub fn iterate_direct(cr: &Fixed, ci: &Fixed, max_iter: u32) -> DirectResult {
-    let orbit = compute(cr, ci, max_iter, &|| false).expect("never cancelled");
+    let orbit = compute(cr, ci, max_iter, &|_| false).expect("never cancelled");
     let last = *orbit.z.last().unwrap();
     let (final_re, final_im) = last.to_c64();
     DirectResult {
@@ -146,7 +162,7 @@ mod tests {
             let bits = 256;
             let cr = dec_to_fixed(re, bits);
             let ci = dec_to_fixed(im, bits);
-            let ours = compute(&cr, &ci, iters, &|| false).unwrap();
+            let ours = compute(&cr, &ci, iters, &|_| false).unwrap();
             let (n, esc, pts) = oracle(re, im, bits as usize + 64, iters);
             assert_eq!(ours.escaped, esc, "escape flag for {re}+{im}i");
             assert_eq!(ours.z.len() as u32 - 1, n, "escape iteration for {re}+{im}i");
@@ -158,14 +174,53 @@ mod tests {
         }
     }
 
+    /// The orbit loop before the in-place kernels, kept as a reference.
+    fn compute_with_fixed(cr: &Fixed, ci: &Fixed, max_iter: u32) -> Vec<CFe> {
+        let limbs = cr.mag.len();
+        let (mut zr, mut zi) = (Fixed::zero(limbs), Fixed::zero(limbs));
+        let mut z = vec![CFe::ZERO];
+        for _ in 0..max_iter {
+            let zr2 = zr.sqr();
+            let zi2 = zi.sqr();
+            let s = zr.add(&zi).sqr();
+            zi = s.sub(&zr2).sub(&zi2).add(ci);
+            zr = zr2.sub(&zi2).add(cr);
+            let v = CFe::from_parts(zr.to_fe(), zi.to_fe());
+            z.push(v);
+            if v.norm2().to_f64() > BAILOUT * BAILOUT {
+                break;
+            }
+        }
+        z
+    }
+
+    #[test]
+    fn in_place_orbit_is_bit_identical() {
+        let cases = [
+            ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", 128, 3000),
+            ("-1.25066", "0.02012", 64, 5000),
+            ("0", "1", 700, 4000),
+            ("-1.7499597227903660498914828869567818698263764211926598339406394817478609312213425939651574735513283225818232838960697399040006957697467124389306810227519519014254893497961216924876049386069290213289498", "0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000001", 3400, 3000),
+        ];
+        for (re, im, bits, iters) in cases {
+            let (cr, ci) = (dec_to_fixed(re, bits), dec_to_fixed(im, bits));
+            let ours = compute(&cr, &ci, iters, &|_| false).unwrap().z;
+            let old = compute_with_fixed(&cr, &ci, iters);
+            assert_eq!(ours.len(), old.len(), "{re}");
+            for (k, (a, b)) in ours.iter().zip(&old).enumerate() {
+                assert!(a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits() && a.e == b.e, "{re}: differs at {k}");
+            }
+        }
+    }
+
     #[test]
     fn deep_coordinate_precision_is_sufficient() {
         // A coordinate specified to ~1000 bits: compare bits vs bits+64.
         let re = "-1.7499597227903660498914828869567818698263764211926598339406394817478609312213425939651574735513283225818232838960697399040006957697467124389306810227519519014254893497961216924876049386069290213289498";
         let im = "0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001";
         for bits in [700u32, 1100] {
-            let a = compute(&dec_to_fixed(re, bits), &dec_to_fixed(im, bits), 20000, &|| false).unwrap();
-            let b = compute(&dec_to_fixed(re, bits + 64), &dec_to_fixed(im, bits + 64), 20000, &|| false).unwrap();
+            let a = compute(&dec_to_fixed(re, bits), &dec_to_fixed(im, bits), 20000, &|_| false).unwrap();
+            let b = compute(&dec_to_fixed(re, bits + 64), &dec_to_fixed(im, bits + 64), 20000, &|_| false).unwrap();
             assert_eq!(a.z.len(), b.z.len(), "escape count differs at {bits} bits");
             assert_eq!(a.escaped, b.escaped);
         }
@@ -178,7 +233,7 @@ mod tests {
         let l = limbs_for_bits(256);
         let c = Point { re: Fixed::from_decimal("-1.75", l).unwrap(), im: Fixed::zero(l) };
         let n = newton_nucleus(&c, 3, 100).unwrap();
-        let o = compute(&n.re, &n.im, 100000, &|| false).unwrap();
+        let o = compute(&n.re, &n.im, 100000, &|_| false).unwrap();
         assert!(o.periodic && !o.escaped);
         assert_eq!(o.z.len(), 4);
     }
@@ -186,14 +241,14 @@ mod tests {
     #[test]
     fn cancellation() {
         let c = Fixed::from_f64(-0.1, 4);
-        assert!(compute(&c, &c, 100000, &|| true).is_none());
+        assert!(compute(&c, &c, 100000, &|_| true).is_none());
     }
 
     #[test]
     fn interior_point_reports_min_abs() {
         // c = -1 has the period-2 orbit 0, -1, 0, -1 ... so |Z| reaches exactly 0.
         let c = Fixed::from_f64(-1.0, 3);
-        let o = compute(&c, &Fixed::zero(3), 10, &|| false).unwrap();
+        let o = compute(&c, &Fixed::zero(3), 10, &|_| false).unwrap();
         assert!(!o.escaped && o.periodic);
         assert_eq!(o.min_log2_abs, f64::NEG_INFINITY);
     }
