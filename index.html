@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ITERUM</title>
+    <link rel="stylesheet" href="/src/ui/overlay.css" />
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+    <div id="ui">
+      <header id="mark">ITERUM</header>
+      <section id="caption">
+        <div class="title"><span class="en"></span><span class="ja"></span></div>
+        <div class="formula"></div>
+      </section>
+      <section id="info" hidden>
+        <p class="description"></p>
+      </section>
+      <nav id="selector"></nav>
+      <aside id="notice"></aside>
+      <aside id="toast"></aside>
+      <section id="help" hidden>
+        <h2>操作</h2>
+        <dl></dl>
+      </section>
+      <pre id="debug" hidden></pre>
+      <section id="unsupported" hidden>
+        <h1>ITERUM</h1>
+        <p class="reason"></p>
+      </section>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

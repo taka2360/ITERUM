@@ -1,0 +1,32 @@
+[package]
+name = "iterum"
+version = "0.1.0"
+edition = "2021"
+description = "ITERUM - a quiet museum of mathematical beauty"
+
+[lib]
+name = "iterum_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Independent arbitrary-precision oracle, used only to cross-check the fixed-point orbit code.
+astro-float = "0.9"
+
+# Reference orbits are computed in the dev build too, so keep it optimized.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
