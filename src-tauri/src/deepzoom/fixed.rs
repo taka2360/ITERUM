@@ -188,20 +188,7 @@ impl Fixed {
 
     /// Converts to an extended-exponent float, keeping the top 64 significant bits.
     pub fn to_fe(&self) -> Fe {
-        let l = self.mag.len();
-        let Some(top) = (0..l).rev().find(|&i| self.mag[i] != 0) else {
-            return Fe::ZERO;
-        };
-        let lz = self.mag[top].leading_zeros();
-        let mut word = self.mag[top] << lz;
-        if lz > 0 && top > 0 {
-            word |= self.mag[top - 1] >> (64 - lz);
-        }
-        // The top set bit sits at global position p = 64*top + 63 - lz, so the
-        // value is (word / 2^64) * 2^(p + 1 - 64*(L-1)).
-        let exp = 64 * top as i32 + 64 - lz as i32 - 64 * (l as i32 - 1);
-        let m = word as f64 / TWO64;
-        Fe::new(if self.neg { -m } else { m }, exp)
+        kernel::to_fe(self.neg, &self.mag)
     }
 
     pub fn to_f64(&self) -> f64 {
@@ -271,6 +258,96 @@ fn mul_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
         }
     }
     acc[l - 1..2 * l - 1].to_vec()
+}
+
+/// Allocation-free kernels for the reference-orbit loop. Each computes exactly
+/// (bit for bit) what the corresponding `Fixed` method computes, into
+/// caller-provided buffers of the same limb count.
+pub mod kernel {
+    use super::{Fe, TWO64};
+    use std::cmp::Ordering;
+
+    /// Value `(-1)^neg * mag` as a floatexp (top 64 significant bits).
+    pub fn to_fe(neg: bool, mag: &[u64]) -> Fe {
+        let l = mag.len();
+        let Some(top) = (0..l).rev().find(|&i| mag[i] != 0) else {
+            return Fe::ZERO;
+        };
+        let lz = mag[top].leading_zeros();
+        let mut word = mag[top] << lz;
+        if lz > 0 && top > 0 {
+            word |= mag[top - 1] >> (64 - lz);
+        }
+        // The top set bit sits at global position p = 64*top + 63 - lz, so the
+        // value is (word / 2^64) * 2^(p + 1 - 64*(L-1)).
+        let exp = 64 * top as i32 + 64 - lz as i32 - 64 * (l as i32 - 1);
+        let m = word as f64 / TWO64;
+        Fe::new(if neg { -m } else { m }, exp)
+    }
+
+    /// Signed sum `out = a + b`; returns the sign of `out` (false for zero).
+    pub fn add_into(an: bool, a: &[u64], bn: bool, b: &[u64], out: &mut [u64]) -> bool {
+        let neg = if an == bn {
+            let mut carry = false;
+            for i in 0..a.len() {
+                let (s1, c1) = a[i].overflowing_add(b[i]);
+                let (s2, c2) = s1.overflowing_add(carry as u64);
+                out[i] = s2;
+                carry = c1 || c2;
+            }
+            an
+        } else {
+            let (hi, lo, neg) = if cmp(a, b) != Ordering::Less { (a, b, an) } else { (b, a, bn) };
+            let mut borrow = false;
+            for i in 0..a.len() {
+                let (d1, b1) = hi[i].overflowing_sub(lo[i]);
+                let (d2, b2) = d1.overflowing_sub(borrow as u64);
+                out[i] = d2;
+                borrow = b1 || b2;
+            }
+            neg
+        };
+        neg && out.iter().any(|&w| w != 0)
+    }
+
+    fn cmp(a: &[u64], b: &[u64]) -> Ordering {
+        for i in (0..a.len()).rev() {
+            match a[i].cmp(&b[i]) {
+                Ordering::Equal => continue,
+                o => return o,
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// `out = a² >> 64*(L-1)` with the same truncation as `Fixed::sqr`.
+    /// `acc` is scratch of at least 2L+1 limbs.
+    pub fn sqr_into(a: &[u64], acc: &mut [u64], out: &mut [u64]) {
+        let l = a.len();
+        let acc = &mut acc[..2 * l + 1];
+        acc.fill(0);
+        let lowest = l.saturating_sub(2);
+        for i in 0..l {
+            if a[i] == 0 {
+                continue;
+            }
+            let mut carry: u128 = 0;
+            for j in lowest.saturating_sub(i)..l {
+                let k = i + j;
+                let t = (a[i] as u128) * (a[j] as u128) + acc[k] as u128 + carry;
+                acc[k] = t as u64;
+                carry = t >> 64;
+            }
+            let mut k = i + l;
+            while carry != 0 {
+                let t = acc[k] as u128 + carry;
+                acc[k] = t as u64;
+                carry = t >> 64;
+                k += 1;
+            }
+        }
+        out.copy_from_slice(&acc[l - 1..2 * l - 1]);
+    }
 }
 
 fn div_small(mag: &mut [u64], d: u64) {
@@ -375,6 +452,51 @@ mod tests {
         assert_eq!(Fixed::from_decimal(x, 6).unwrap().to_decimal(60), &x[..62]);
         let r = Fixed::from_decimal("0.3", 3).unwrap();
         assert_eq!(r.resized(5).resized(3), r);
+    }
+
+    /// Deterministic pseudo-random fixed-point values in (-4, 4), including
+    /// zero limbs, all-ones runs and zero (carry and sign edge cases).
+    fn rand_fixed(seed: &mut u64, limbs: usize) -> Fixed {
+        let mut next = || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        let neg = next() & 1 == 1;
+        let mut mag: Vec<u64> = (0..limbs).map(|_| next()).collect();
+        mag[limbs - 1] &= 3;
+        match next() % 6 {
+            0 => mag[limbs - 1] = 0,
+            1 => mag[0] = u64::MAX,
+            2 => mag.iter_mut().take(limbs - 1).for_each(|w| *w = u64::MAX),
+            3 => mag.iter_mut().skip(1).for_each(|w| *w = 0),
+            4 => mag.iter_mut().for_each(|w| *w = 0),
+            _ => {}
+        }
+        Fixed { neg, mag }.normalized()
+    }
+
+    #[test]
+    fn kernels_match_fixed_bit_for_bit() {
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        for limbs in [2usize, 3, 4, 17, 54, 105] {
+            let mut acc = vec![0u64; 2 * limbs + 1];
+            let mut out = vec![0u64; limbs];
+            for _ in 0..300 {
+                let a = rand_fixed(&mut seed, limbs);
+                let b = rand_fixed(&mut seed, limbs);
+                kernel::sqr_into(&a.mag, &mut acc, &mut out);
+                assert_eq!(out, a.sqr().mag, "sqr, {limbs} limbs");
+                let neg = kernel::add_into(a.neg, &a.mag, b.neg, &b.mag, &mut out);
+                assert_eq!(Fixed { neg, mag: out.clone() }, a.add(&b), "add, {limbs} limbs");
+                let neg = kernel::add_into(a.neg, &a.mag, !b.neg, &b.mag, &mut out);
+                assert_eq!(Fixed { neg, mag: out.clone() }, a.sub(&b), "sub, {limbs} limbs");
+                assert_eq!(kernel::to_fe(a.neg, &a.mag), a.to_fe());
+                // Exact cancellation gives +0.
+                assert!(!kernel::add_into(a.neg, &a.mag, !a.neg, &a.mag, &mut out));
+            }
+        }
     }
 
     #[test]
