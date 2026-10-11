@@ -485,6 +485,8 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   let dc = perturb_dc(pix);
   let last = P.orbit_len - 1u;
   let stop = stop_at((*s).rebases, pix);
+  // Z_m, carried from step to step: each step reads only the next point.
+  var zm = orbit_f(m);
   var cyc_d = d;        // Brent: saved state (δ, m)
   var cyc_m = m;
   var cyc_len = 0u;
@@ -526,13 +528,13 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       }
     }
     if (!stepped) {
-      let zm = orbit_f(m);
       g = 2.0 * cmul(zm + d, g) + vec2<f32>(sp, 0.0);
       d = cmul(2.0 * zm + d, d) + dc;
       m++;
       n++;
     }
-    let z = orbit_f(m) + d;
+    zm = orbit_f(m);
+    let z = zm + d;
     let r2 = dot(z, z);
     (*s).trap = min((*s).trap, r2);
     if (r2 > BAIL2) {
@@ -556,6 +558,7 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
     if (r2 < dot(d, d) || m >= last) {
       d = z;
       m = 0u;
+      zm = orbit_f(0u);
       rebases++;
     }
     if (bad2(d)) { (*s).n = n; finish_anomaly(s, idx); return; }
@@ -592,6 +595,8 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   let dc = deep_dc(pix);
   let last = P.orbit_len - 1u;
   let stop = stop_at((*s).rebases, pix);
+  // Z_m, carried from step to step: each step reads only the next point.
+  var zm = orbit_cf(m);
   var cyc_d = d;        // Brent: saved state (δ, m)
   var cyc_m = m;
   var cyc_len = 0u;
@@ -635,13 +640,13 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
       }
     }
     if (!stepped) {
-      let zm = orbit_cf(m);
       g = cf_add(cf_mul(cf_add(zm, d), cf_scale(g, FE(0.5, 2))), sp_c);
       d = cf_add(cf_mul(cf_add(cf_scale(zm, FE(0.5, 2)), d), d), dc);
       m++;
       n++;
     }
-    let z = cf_add(orbit_cf(m), d);
+    zm = orbit_cf(m);
+    let z = cf_add(zm, d);
     if (z.e < -40) { (*s).trap = 0.0; }
     if (z.e >= -40) {
       let zf = cf_to_vec2(z);
@@ -670,6 +675,7 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
     if (closer || m >= last) {
       d = z;
       m = 0u;
+      zm = orbit_cf(0u);
       rebases++;
     }
     if (bad2(d.v)) { (*s).n = n; finish_anomaly(s, idx); return; }
