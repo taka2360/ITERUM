@@ -30,6 +30,12 @@
 // Progressive order: STEP 0 handles every 4th pixel in x and y, STEP 1 the
 // remaining even pixels, STEP 2 the rest; the display pass fills gaps from
 // coarser pixels.
+//
+// Compaction: once few pixels are still running, a list of their indices is
+// built (build_list) and only those are dispatched (iterate_list, indirect),
+// each appending itself to the next list if it is still running, so SIMD
+// lanes are not spent on finished pixels. Results do not depend on the order
+// or grouping in which pixels advance.
 
 override MODE: u32 = 0u;
 
@@ -50,7 +56,7 @@ struct Params {
   orbit_len: u32,
   bla_levels: u32,
   sample: u32,
-  _p3: u32,
+  list_in: u32,          // list mode: which of the two lists is read (0 or 1)
   // 1: the orbit is truncated and a longer one with the same prefix is coming.
   // Rebasing at its end would replace δ by the full z (|z| ~ 1), losing the
   // pixel's offset in f32, so pixels wait there instead and continue exactly
@@ -90,6 +96,17 @@ struct Counters {
 }
 
 var<workgroup> wg_iterations: atomic<u32>;
+var<workgroup> wg_keep: atomic<u32>;
+var<workgroup> wg_base: u32;
+// Iteration budget of the pixel being processed (per progressive step).
+var<private> budget: u32;
+
+// List entries: pixel index | step << 30. ctl.count: entries in list 0, 1.
+// args (bound only to list_args, used as the indirect buffer): dispatch
+// arguments (x, y, z, _) for list 0, then for list 1.
+struct ListCtl { count: array<atomic<u32>, 4> }
+const LIST_GROUP: u32 = 64u;
+const MAX_GROUPS_X: u32 = 32768u;
 
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read_write> state: array<PixelState>;
@@ -98,6 +115,10 @@ var<workgroup> wg_iterations: atomic<u32>;
 @group(0) @binding(4) var<storage, read> orbit: array<OrbitPt>;
 @group(0) @binding(5) var<storage, read> bla: array<Bla>;
 @group(0) @binding(6) var<storage, read> bla_off: array<u32>;
+@group(0) @binding(7) var<storage, read_write> list0: array<u32>;
+@group(0) @binding(8) var<storage, read_write> list1: array<u32>;
+@group(0) @binding(9) var<storage, read_write> ctl: ListCtl;
+@group(0) @binding(10) var<storage, read_write> args: array<u32, 8>;
 
 #include floatexp
 
@@ -201,7 +222,7 @@ fn iterate_direct(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var cyc = z;          // Brent: saved state, steps since saving, power of two
   var cyc_len = 0u;
   var cyc_pow = 1u;
-  for (var k = 0u; k < P.budget; k++) {
+  for (var k = 0u; k < budget; k++) {
     if (n >= P.max_iter) {
       (*s).dr = z.x; (*s).di = z.y; (*s).gr = g.x; (*s).gi = g.y; (*s).n = n;
       pause_at_limit(s, idx);
@@ -243,7 +264,7 @@ fn iterate_perturb(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var cyc_m = m;
   var cyc_len = 0u;
   var cyc_pow = 1u;
-  for (var k = 0u; k < P.budget; k++) {
+  for (var k = 0u; k < budget; k++) {
     if (n >= P.max_iter) {
       (*s).dr = d.x; (*s).di = d.y; (*s).gr = g.x; (*s).gi = g.y; (*s).m = m; (*s).n = n;
       (*s).rebases += rebases;
@@ -348,7 +369,7 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   var cyc_m = m;
   var cyc_len = 0u;
   var cyc_pow = 1u;
-  for (var k = 0u; k < P.budget; k++) {
+  for (var k = 0u; k < budget; k++) {
     if (n >= P.max_iter) {
       (*s).dr = d.v.x; (*s).di = d.v.y; (*s).de = d.e;
       (*s).gr = g.v.x; (*s).gi = g.v.y; (*s).ge = g.e;
@@ -444,15 +465,20 @@ fn iterate_deep(s: ptr<function, PixelState>, pix: vec2<u32>, idx: u32) {
   atomicAdd(&counters.unfinished, 1u);
 }
 
-// Advances one pixel; returns the number of iterations it moved forward.
-fn process(gid: vec3<u32>) -> u32 {
-  let stride = 1u << (2u - P.step);
-  let pix = gid.xy * stride;
-  if (pix.x >= P.size.x || pix.y >= P.size.y) { return 0u; }
-  if (P.step > 0u) {
-    let coarse = stride * 2u;
-    if (pix.x % coarse == 0u && pix.y % coarse == 0u) { return 0u; }
-  }
+// Running (or waiting for a longer orbit) after this pass: stays in the list.
+var<private> still_active: bool;
+
+fn step_of(pix: vec2<u32>) -> u32 {
+  if ((pix.x & 3u) == 0u && (pix.y & 3u) == 0u) { return 0u; }
+  if ((pix.x & 1u) == 0u && (pix.y & 1u) == 0u) { return 1u; }
+  return 2u;
+}
+
+// Advances one pixel of progressive step `step` (the budget P.budget is the
+// step-2 budget; coarser steps get more); returns the number of iterations it moved forward.
+fn process_pixel(pix: vec2<u32>, step: u32) -> u32 {
+  still_active = false;
+  budget = max(16u, P.budget << (2u - step));
   let idx = pix.y * P.size.x + pix.x;
   var s = state[idx];
   if (s.job != P.job) { s = init_state(pix); }
@@ -465,8 +491,9 @@ fn process(gid: vec3<u32>) -> u32 {
       s.status = 0u;
     } else {
       atomicAdd(&counters.unfinished, 1u);
-      if (P.step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
-      if (P.step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
+      if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
+      if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
+      still_active = true;
       return 0u;
     }
   }
@@ -481,10 +508,23 @@ fn process(gid: vec3<u32>) -> u32 {
   }
   state[idx] = s;
   if (s.status == 0u || s.status == 5u) {
-    if (P.step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
-    if (P.step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
+    if (step == 0u) { atomicAdd(&counters.unfinished_coarse, 1u); }
+    if (step == 1u) { atomicAdd(&counters.unfinished_mid, 1u); }
+    still_active = true;
   }
   return min(s.n - n0, 1u << 25u);
+}
+
+// Full-grid pass over the pixels of progressive step P.step.
+fn process(gid: vec3<u32>) -> u32 {
+  let stride = 1u << (2u - P.step);
+  let pix = gid.xy * stride;
+  if (pix.x >= P.size.x || pix.y >= P.size.y) { return 0u; }
+  if (P.step > 0u) {
+    let coarse = stride * 2u;
+    if (pix.x % coarse == 0u && pix.y % coarse == 0u) { return 0u; }
+  }
+  return process_pixel(pix, P.step);
 }
 
 @compute @workgroup_size(8, 8)
@@ -495,4 +535,80 @@ fn iterate(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocat
   atomicAdd(&wg_iterations, process(gid));
   workgroupBarrier();
   if (li == 0u) { atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u); }
+}
+
+fn list_read(which: u32, i: u32) -> u32 {
+  if (which == 0u) { return list0[i]; }
+  return list1[i];
+}
+
+fn list_write(which: u32, i: u32, v: u32) {
+  if (which == 0u) { list0[i] = v; } else { list1[i] = v; }
+}
+
+// Appends `entry` (if `keep`) to list `out` with one global atomic per workgroup.
+// Must be called in uniform control flow by every invocation of the group.
+fn list_append(li: u32, keep: bool, entry: u32, out: u32) {
+  if (li == 0u) { atomicStore(&wg_keep, 0u); }
+  workgroupBarrier();
+  var slot = 0u;
+  if (keep) { slot = atomicAdd(&wg_keep, 1u); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let n = atomicLoad(&wg_keep);
+    if (n > 0u) { wg_base = atomicAdd(&ctl.count[out], n); }
+  }
+  workgroupBarrier();
+  if (keep) { list_write(out, wg_base + slot, entry); }
+}
+
+// Builds list P.list_in from the full grid: every pixel the current job still
+// has to advance. Dispatched 2D like iterate_list.
+@compute @workgroup_size(64)
+fn build_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let total = P.size.x * P.size.y;
+  let idx = (wid.y * nwg.x + wid.x) * LIST_GROUP + li;
+  var keep = false;
+  var entry = 0u;
+  if (idx < total) {
+    let pix = vec2<u32>(idx % P.size.x, idx / P.size.x);
+    let s = state[idx];
+    keep = s.job != P.job || s.status == 0u || s.status == 5u || (s.status == 2u && s.n < P.max_iter);
+    entry = idx | (step_of(pix) << 30u);
+  }
+  list_append(li, keep, entry, P.list_in);
+}
+
+// Advances the pixels of list P.list_in; those still running go to the other list.
+@compute @workgroup_size(64)
+fn iterate_list(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+  let i = (wid.y * nwg.x + wid.x) * LIST_GROUP + li;
+  let count = atomicLoad(&ctl.count[P.list_in]);
+  if (li == 0u) { atomicStore(&wg_iterations, 0u); }
+  workgroupBarrier();
+  var entry = 0u;
+  var keep = false;
+  if (i < count) {
+    entry = list_read(P.list_in, i);
+    let idx = entry & 0x3fffffffu;
+    let pix = vec2<u32>(idx % P.size.x, idx / P.size.x);
+    atomicAdd(&wg_iterations, process_pixel(pix, entry >> 30u));
+    keep = still_active;
+  }
+  workgroupBarrier();
+  if (li == 0u) { atomicAdd(&counters.iterations256, atomicLoad(&wg_iterations) >> 8u); }
+  list_append(li, keep, entry, 1u - P.list_in);
+}
+
+// Indirect dispatch arguments for list P.list_in (2D: x ≤ MAX_GROUPS_X).
+@compute @workgroup_size(1)
+fn list_args() {
+  let which = P.list_in;
+  let groups = (atomicLoad(&ctl.count[which]) + LIST_GROUP - 1u) / LIST_GROUP;
+  let x = min(groups, MAX_GROUPS_X);
+  var y = 0u;
+  if (x > 0u) { y = (groups + x - 1u) / x; }
+  args[which * 4u] = x;
+  args[which * 4u + 1u] = y;
+  args[which * 4u + 2u] = 1u;
 }

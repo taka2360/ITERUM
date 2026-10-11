@@ -92,6 +92,8 @@ export interface EscapeStats {
   unfinished: number;
   escaped: number;
   interior: number;
+  /** Interior pixels found cycling (subset of interior). */
+  cycling: number;
   anomalies: number;
   rebases: number;
   blaSteps: number;
@@ -121,6 +123,21 @@ export class EscapeEngine {
   private computeLayout!: GPUBindGroupLayout;
   private displayLayout!: GPUBindGroupLayout;
   private pipelines: GPUComputePipeline[] = [];
+  // Compaction (see escape.wgsl): per-mode list pipelines, the indirect-args
+  // pipeline, two index lists, their counts and the dispatch arguments.
+  private buildPipelines: GPUComputePipeline[] = [];
+  private listPipelines: GPUComputePipeline[] = [];
+  private argsPipeline!: GPUComputePipeline;
+  private argsLayout!: GPUBindGroupLayout;
+  private lists: GPUBuffer[] = [];
+  private listCtl!: GPUBuffer;
+  private listArgs!: GPUBuffer;
+  private listParams: GPUBuffer[] = [];
+  private listGroups: GPUBindGroup[] = [];
+  private argsGroups: GPUBindGroup[] = [];
+  private listMode = false;
+  private listBuild = false;
+  private listCur = 0;
   private displayPipeline!: GPURenderPipeline;
   private params: GPUBuffer[] = [];
   private displayParams!: GPUBuffer;
@@ -159,6 +176,11 @@ export class EscapeEngine {
   minIter = 500;
   maxIterCap = 1 << 24;
   sampleTarget = MAX_SAMPLES;
+  /**
+   * Switch to dispatching only unfinished pixels (compaction) once fewer than
+   * this fraction of the pixels is still running; 0 disables it.
+   */
+  compactBelow = 0.25;
   /** Target GPU milliseconds per frame for iteration. */
   targetMs = 9;
   /** density: palette cycles per doubling of (iterations − sMin)/bandScale. */
@@ -191,12 +213,42 @@ export class EscapeEngine {
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: ro },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: ro },
         { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: ro },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+      ],
+    });
+    this.argsLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: rw },
+        { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: rw },
       ],
     });
     const module = shaderModule(device, "escape", wgsl(escapeSrc));
     const layout = device.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
-    this.pipelines = [0, 1, 2, 3].map((mode) =>
-      device.createComputePipeline({ label: `escape-${mode}`, layout, compute: { module, entryPoint: "iterate", constants: { MODE: mode } } }),
+    const pipe = (entryPoint: string, mode: number) =>
+      device.createComputePipeline({ label: `escape-${entryPoint}-${mode}`, layout, compute: { module, entryPoint, constants: { MODE: mode } } });
+    this.pipelines = [0, 1, 2, 3].map((mode) => pipe("iterate", mode));
+    this.listPipelines = [0, 1, 2, 3].map((mode) => pipe("iterate_list", mode));
+    this.buildPipelines = [0, 1, 2, 3].map((mode) => pipe("build_list", mode));
+    this.argsPipeline = device.createComputePipeline({
+      label: "escape-list-args",
+      layout: device.createPipelineLayout({ bindGroupLayouts: [this.argsLayout] }),
+      compute: { module, entryPoint: "list_args" },
+    });
+    this.listCtl = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.listArgs = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT });
+    this.listParams = [0, 1].map(() => device.createBuffer({ size: PARAM_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }));
+    this.argsGroups = this.listParams.map((p) =>
+      device.createBindGroup({
+        layout: this.argsLayout,
+        entries: [
+          { binding: 0, resource: { buffer: p } },
+          { binding: 9, resource: { buffer: this.listCtl } },
+          { binding: 10, resource: { buffer: this.listArgs } },
+        ],
+      }),
     );
     this.displayLayout = device.createBindGroupLayout({
       entries: [
@@ -235,7 +287,9 @@ export class EscapeEngine {
     this.state?.destroy();
     this.samples?.destroy();
     for (const t of this.outputs) t.destroy();
+    for (const l of this.lists) l.destroy();
     const device = this.device;
+    this.lists = [0, 1].map(() => device.createBuffer({ size: Math.max(64, w * h * 4), usage: GPUBufferUsage.STORAGE }));
     this.state = device.createBuffer({ size: Math.max(64, w * h * STATE_BYTES), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     this.samples = device.createBuffer({ size: Math.max(64, w * h * 8 * MAX_SAMPLES), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     this.outputs = [0, 1].map(() =>
@@ -283,6 +337,7 @@ export class EscapeEngine {
     this.samplesDone = 0;
     this.converged = false;
     this.framesSinceJob = 0;
+    this.listMode = false;
     this.resetAgg();
   }
 
@@ -319,6 +374,7 @@ export class EscapeEngine {
       unfinished: this.agg.unfinished,
       escaped: this.agg.escaped,
       interior: this.agg.interior,
+      cycling: this.agg.cycling,
       anomalies: this.agg.anomalies,
       rebases: this.agg.rebases,
       blaSteps: this.agg.blaSteps,
@@ -333,7 +389,7 @@ export class EscapeEngine {
     const key = `${this.width}x${this.height}:${orbit?.id ?? "none"}`;
     if (key === this.computeGroupKey) return this.computeGroups;
     this.computeGroupKey = key;
-    this.computeGroups = this.params.map((p) =>
+    const group = (p: GPUBuffer) =>
       this.device.createBindGroup({
         layout: this.computeLayout,
         entries: [
@@ -344,9 +400,13 @@ export class EscapeEngine {
           { binding: 4, resource: { buffer: orbit?.orbit ?? this.dummy } },
           { binding: 5, resource: { buffer: orbit?.bla ?? this.dummy } },
           { binding: 6, resource: { buffer: orbit?.blaOff ?? this.dummy } },
+          { binding: 7, resource: { buffer: this.lists[0] } },
+          { binding: 8, resource: { buffer: this.lists[1] } },
+          { binding: 9, resource: { buffer: this.listCtl } },
         ],
-      }),
-    );
+      });
+    this.computeGroups = this.params.map(group);
+    this.listGroups = this.listParams.map(group);
     return this.computeGroups;
   }
 
@@ -386,7 +446,7 @@ export class EscapeEngine {
       this.framesSinceJob++;
       const groups = this.computeGroupsFor(view.orbit);
       const jit = JITTER[this.sample % JITTER.length];
-      for (let step = 0; step < 3; step++) {
+      const writeParams = (target: GPUBuffer, step: number, listIn: number) => {
         const buf = new ArrayBuffer(PARAM_BYTES);
         const u = new Uint32Array(buf);
         const f = new Float32Array(buf);
@@ -398,24 +458,56 @@ export class EscapeEngine {
         f[10] = view.juliaC[0]; f[11] = view.juliaC[1];
         f[12] = view.spacing.m; i[13] = view.spacing.e;
         u[14] = this.maxIter;
-        // Coarse steps cover fewer pixels, so they get a larger share.
-        u[15] = Math.max(16, Math.round(this.budget * [4, 2, 1][step]));
+        // Budget of the finest step; the shader gives coarser steps (fewer
+        // pixels) 2× and 4× as much.
+        u[15] = Math.max(16, Math.round(this.budget));
         u[16] = view.orbit?.len ?? 0;
         u[17] = view.orbit?.levels ?? 0;
         u[18] = this.sample;
         const o = view.orbit;
         u[20] = this.orbitExtends && o && !o.escaped && !o.periodic ? 1 : 0;
-        device.queue.writeBuffer(this.params[step], 0, buf);
-      }
+        u[19] = listIn;
+        device.queue.writeBuffer(target, 0, buf);
+      };
       device.queue.writeBuffer(this.counters, 0, new Uint32Array([0, 0, 0, 0, 0, 0, 0xffffffff, 0, 0, 0, 0, 0, 0]));
-      const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
-      pass.setPipeline(this.pipelines[view.mode]);
-      for (let step = 0; step < 3; step++) {
-        const stride = 1 << (2 - step);
-        pass.setBindGroup(0, groups[step]);
-        pass.dispatchWorkgroups(Math.ceil(Math.ceil(w / stride) / 8), Math.ceil(Math.ceil(h / stride) / 8));
+      if (!this.listMode) {
+        for (let step = 0; step < 3; step++) writeParams(this.params[step], step, 0);
+        const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
+        pass.setPipeline(this.pipelines[view.mode]);
+        for (let step = 0; step < 3; step++) {
+          const stride = 1 << (2 - step);
+          pass.setBindGroup(0, groups[step]);
+          pass.dispatchWorkgroups(Math.ceil(Math.ceil(w / stride) / 8), Math.ceil(Math.ceil(h / stride) / 8));
+        }
+        pass.end();
+      } else {
+        // listGroups[k] reads list k and appends survivors to list 1 − k.
+        const cur = this.listCur;
+        const other = 1 - cur;
+        writeParams(this.listParams[0], 2, 0);
+        writeParams(this.listParams[1], 2, 1);
+        if (this.listBuild) {
+          this.listBuild = false;
+          enc.clearBuffer(this.listCtl, cur * 4, 4);
+          const groupsTotal = Math.ceil((w * h) / 64);
+          const x = Math.min(groupsTotal, 32768);
+          const pass = enc.beginComputePass({ label: "escape-build", timestampWrites: frame.timer.writes("escape") });
+          pass.setPipeline(this.buildPipelines[view.mode]);
+          pass.setBindGroup(0, this.listGroups[cur]);
+          pass.dispatchWorkgroups(x, Math.ceil(groupsTotal / x));
+          pass.end();
+        }
+        enc.clearBuffer(this.listCtl, other * 4, 4);
+        const pass = enc.beginComputePass({ label: "escape", timestampWrites: frame.timer.writes("escape") });
+        pass.setPipeline(this.argsPipeline);
+        pass.setBindGroup(0, this.argsGroups[cur]);
+        pass.dispatchWorkgroups(1);
+        pass.setPipeline(this.listPipelines[view.mode]);
+        pass.setBindGroup(0, this.listGroups[cur]);
+        pass.dispatchWorkgroupsIndirect(this.listArgs, cur * 16);
+        pass.end();
+        this.listCur = other;
       }
-      pass.end();
       this.scheduleReadback(enc);
     }
 
@@ -512,6 +604,11 @@ export class EscapeEngine {
     a.blaSteps += c[7];
     a.late += c[8];
     a.cycling += c[12];
+    // Few pixels left: from now on dispatch only those.
+    if (c[0] !== 0 && !this.listMode && c[0] < this.width * this.height * this.compactBelow) {
+      this.listMode = true;
+      this.listBuild = true;
+    }
     if (c[0] !== 0) return;
     // Sample complete.
     this.lastComplete = this.stats();
@@ -531,6 +628,7 @@ export class EscapeEngine {
     this.sample = this.samplesDone;
     this.job++;
     this.framesSinceJob = 0;
+    this.listMode = false;
     this.resetAgg();
   }
 
@@ -546,6 +644,8 @@ export class EscapeEngine {
     // pixels at the old limit are counted again when they stop or escape.
     // Cycling pixels stay interior (they would stop at every limit).
     this.agg.interior = this.agg.cycling;
+    // Pixels at the old limit are not in the list: rebuild it.
+    if (this.listMode) this.listBuild = true;
     this.agg.late = 0;
     this.agg.unfinished = -1;
   }
@@ -664,6 +764,9 @@ export class EscapeEngine {
     this.samples?.destroy();
     for (const t of this.outputs) t.destroy();
     this.counters?.destroy();
+    for (const l of this.lists) l.destroy();
+    this.listCtl?.destroy();
+    this.listArgs?.destroy();
     for (const r of this.readbacks) r.buffer.destroy();
   }
 }

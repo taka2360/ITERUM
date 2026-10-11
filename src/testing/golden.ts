@@ -57,6 +57,7 @@ export interface GoldenResult {
   iterations: number;
   escaped: number;
   interior: number;
+  cycling: number;
   anomalies: number;
   orbitMs?: number;
 }
@@ -127,6 +128,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
       iterations: engine.iterationsTotal,
       escaped: s.escaped,
       interior: s.interior,
+      cycling: s.cycling,
       anomalies: s.anomalies,
       orbitMs: orbitMs !== undefined ? +orbitMs.toFixed(1) : undefined,
     },
