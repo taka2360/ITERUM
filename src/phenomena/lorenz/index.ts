@@ -34,7 +34,7 @@ export class Lorenz implements Phenomenon {
       '<math><mtable columnalign="left"><mtr><mtd><mover><mi>x</mi><mo>˙</mo></mover><mo>=</mo><mi>σ</mi><mo>(</mo><mi>y</mi><mo>−</mo><mi>x</mi><mo>)</mo></mtd></mtr><mtr><mtd><mover><mi>y</mi><mo>˙</mo></mover><mo>=</mo><mi>x</mi><mo>(</mo><mi>ρ</mi><mo>−</mo><mi>z</mi><mo>)</mo><mo>−</mo><mi>y</mi></mtd></mtr><mtr><mtd><mover><mi>z</mi><mo>˙</mo></mover><mo>=</mo><mi>x</mi><mi>y</mi><mo>−</mo><mi>β</mi><mi>z</mi></mtd></mtr></mtable><mspace width="1em"/><mi>σ</mi><mo>=</mo><mn>10</mn><mo>,</mo><mi>ρ</mi><mo>=</mo><mn>28</mn><mo>,</mo><mi>β</mi><mo>=</mo><mn>8</mn><mo>/</mo><mn>3</mn></math>',
     description:
       "大気の対流を極端に単純化した三つの方程式。わずかに異なる位置から出発した点はたちまち別々の道を進むのに、全体はいつも同じ蝶の翅のような形の上に留まり続ける。ここでは数十万の粒子がその流れに乗って光の跡を残している。",
-    hints: ["ドラッグ — 回転", "ホイール — 近づく・離れる", "Space — 流れを止める"],
+    controls: [["ドラッグ", "回転"], ["ホイール ／ ダブルクリック", "近づく・離れる"], ["Space", "流れを止める ／ 再開する"]],
     motion: "animation",
   };
 
@@ -271,11 +271,17 @@ export class Lorenz implements Phenomenon {
     return {
       headline: this.paused ? "停止中" : "流れに沿って毎フレーム積分しています",
       rows: [
-        { label: "粒子", value: `${int(s.particles)} 個（先導粒子 56 と、その後を追う粒子）` },
-        { label: "積分", value: `RK4 · ${s.stepsPerFrame} ステップ/フレーム · Δt ${s.dt}` },
-        { label: "積分速度", value: `${bigCount(this.stepRate)} 粒子ステップ/秒` },
-        { label: "シミュレーション時間", value: `t = ${this.simTime.toFixed(1)}` },
-        { label: "残光", value: `1 フレームごとに ${(s.decay * 100).toFixed(0)}% に減衰` },
+        { group: "シミュレーション", label: "粒子", value: `${int(s.particles)} 個（先導粒子 56 と、その後を追う粒子）` },
+        { group: "シミュレーション", label: "積分", value: `RK4 · ${s.stepsPerFrame} ステップ/フレーム · Δt ${s.dt}` },
+        { group: "シミュレーション", detail: true, label: "1 フレームで進む時間", value: `Δt × ${s.stepsPerFrame} = ${(s.dt * s.stepsPerFrame).toFixed(4)}` },
+        { group: "シミュレーション", label: "積分速度", value: `${bigCount(this.stepRate)} 粒子ステップ/秒` },
+        { group: "シミュレーション", label: "シミュレーション時間", value: `t = ${this.simTime.toFixed(1)}` },
+        { group: "シミュレーション", detail: true, label: "方程式の定数", value: "σ = 10 · ρ = 28 · β = 8/3（古典的なカオスの値）" },
+        { group: "見え方", label: "残光", value: `1 フレームごとに ${(s.decay * 100).toFixed(0)}% に減衰（半分になるまで約 ${Math.round(Math.log(0.5) / Math.log(s.decay))} フレーム）` },
+        {
+          group: "見え方", detail: true, label: "カメラ",
+          value: `方位 ${((((this.camera.yaw * 180) / Math.PI) % 360 + 360) % 360).toFixed(0)}° · 仰角 ${((this.camera.pitch * 180) / Math.PI).toFixed(0)}° · 距離 ${this.camera.distance.toFixed(1)}`,
+        },
       ],
     };
   }

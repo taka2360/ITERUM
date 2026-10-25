@@ -3,11 +3,12 @@
 // Mandelbrot set, where Julia sets are most intricate, so the form breathes.
 
 import { Camera2D } from "../../core/camera2d";
-import { numberToDecimal } from "../../ui/location";
 import { feFromLog2 } from "../../core/floatexp";
 import type { InputFrame } from "../../core/input";
-import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo } from "../../core/phenomenon";
-import { bigCount, int, percent, seconds } from "../../ui/format";
+import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo, ProgressRow } from "../../core/phenomenon";
+import { int, percent } from "../../ui/format";
+import { formatZoom, log2ZoomFromScale, numberToDecimal } from "../../ui/location";
+import { iterationRows, pixelRows, stepRows } from "../escape/progress";
 import type { PaletteTexture } from "../../core/palettes";
 import type { GpuContext } from "../../gpu/device";
 import { EscapeEngine, MODE_JULIA, type HistoryMap } from "../escape/engine";
@@ -29,7 +30,7 @@ export class Julia implements Phenomenon {
       '<math><msub><mi>z</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msubsup><mi>z</mi><mi>n</mi><mn>2</mn></msubsup><mo>+</mo><mi>c</mi><mo>,</mo><mspace width="0.6em"/><mi>c</mi><mo>=</mo><mtext class="c-value"></mtext></math>',
     description:
       "マンデルブロ集合と同じ式で、c を固定し出発点 z を動かしたときに逃げない点の集まり。c がマンデルブロ集合の縁をゆっくり巡るにつれ、形はつながった島から塵のような星屑へと姿を変える。",
-    hints: ["ドラッグ — 移動", "ホイール — 拡大・縮小", "右ドラッグ — c を動かす", "Space — 変化を止める"],
+    controls: [["右ドラッグ", "パラメータ c を動かす"], ["ダブルクリック", "その点へ近づく"], ["Space", "c の変化を止める ／ 再開する"]],
     motion: "animation",
   };
 
@@ -80,6 +81,8 @@ export class Julia implements Phenomenon {
 
   update(input: InputFrame, ctx: { time: number; dt: number; paused: boolean; viewW: number; viewH: number }): void {
     const dt = Math.min(ctx.dt, 0.1);
+    this.viewW = ctx.viewW;
+    this.viewH = ctx.viewH;
     if (this.needsHome) {
       this.camera = new Camera2D(0, 0, Math.log2(3.3 / Math.max(1, Math.min(ctx.viewW, ctx.viewH * 1.5))));
       this.needsHome = false;
@@ -157,33 +160,47 @@ export class Julia implements Phenomenon {
   }
 
   private paused = false;
+  private viewW = 1;
+  private viewH = 1;
 
   progress(): ProgressInfo {
     const e = this.engine.progress();
     const c = `${this.c[0].toFixed(5)} ${this.c[1] < 0 ? "−" : "+"} ${Math.abs(this.c[1]).toFixed(5)}i`;
+    const cam = this.camera;
+    let group = "パラメータと位置";
+    const place: ProgressRow[] = [
+      { group, label: "c", value: c },
+      {
+        group, detail: true, label: "c の動き",
+        value: this.paused
+          ? "停止中（Space で再開）"
+          : `主カージオイドの縁をめぐる（角度 ${(((this.theta * 180) / Math.PI) % 360).toFixed(1)}°）`,
+      },
+      {
+        group, detail: true, label: "右ドラッグによるずれ",
+        value: this.manualOffset[0] || this.manualOffset[1] ? `${this.manualOffset[0].toFixed(5)}, ${this.manualOffset[1].toFixed(5)}` : "なし",
+      },
+      { group, detail: true, label: "拡大率", value: formatZoom(log2ZoomFromScale(cam.log2Scale, this.viewW, this.viewH)) },
+      { group, detail: true, label: "中心", value: `${cam.cx.toPrecision(10)} ${cam.cy < 0 ? "−" : "+"} ${Math.abs(cam.cy).toPrecision(10)}i` },
+      { group, detail: true, label: "精度", value: "f32 で直接計算（精度が尽きる手前で拡大を止める）" },
+    ];
     if (!this.paused) {
+      group = "進み具合";
       return {
         headline: "c が動き続けるため、毎フレーム全画素を計算しています",
         rows: [
-          { label: "このフレームの完了率", value: percent(e.sample), bar: e.sample },
-          { label: "反復", value: `上限 ${int(e.maxIter)} · 逃げるまでの最大 ${int(e.maxEscaped)}` },
-          { label: "処理速度", value: `${bigCount(e.iterationsPerSecond)} 反復/秒` },
-          { label: "c", value: c },
-          { label: "画素数", value: int(e.pixels) },
+          { group, label: "このフレームの完了率", value: percent(e.sample), bar: e.sample },
+          ...iterationRows(this.engine, e),
+          ...pixelRows(this.engine, e),
+          ...place,
+          { group: "描画", label: "画素数", value: int(e.pixels) },
         ],
       };
     }
     return {
       fraction: e.overall,
       headline: e.converged ? "完成（停止中）" : `計算中 — ${percent(e.overall)}`,
-      rows: [
-        { label: "全体", value: percent(e.overall), bar: e.overall },
-        { label: "すべての画素", value: percent(e.fine), bar: e.fine },
-        { label: "重ね描き（アンチエイリアス）", value: `${Math.min(e.samplesDone + (e.converged ? 0 : 1), e.sampleTarget)} / ${e.sampleTarget} 枚目` },
-        { label: "反復", value: `上限 ${int(e.maxIter)} · 逃げるまでの最大 ${int(e.maxEscaped)}` },
-        { label: e.converged ? "完成までの時間" : "経過", value: seconds(e.elapsedS) },
-        { label: "c", value: c },
-      ],
+      rows: [...stepRows(e, true), ...iterationRows(this.engine, e), ...pixelRows(this.engine, e), ...place],
     };
   }
 

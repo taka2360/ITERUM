@@ -81,6 +81,8 @@ export interface EscapeProgress {
   moving: boolean;
   /** Iterations advanced per second (BLA spans counted in full). */
   iterationsPerSecond: number;
+  /** Loop steps executed per second (a BLA span counts once). */
+  stepsPerSecond: number;
   elapsedS: number;
   /** Estimated seconds left, if the trend allows an estimate. */
   etaS?: number;
@@ -109,6 +111,12 @@ export interface EscapeStats {
   minEscapedN: number;
   budget: number;
   maxIter: number;
+  /** Escapes in the upper half of the iteration limit (they decide limit raises). */
+  late: number;
+  /** Only the remaining pixels are dispatched (few left). */
+  listMode: boolean;
+  /** Component proofs apply to the current view. */
+  patches: boolean;
 }
 
 // Counters (escape.wgsl): words 0..16 count this frame's events and are
@@ -397,7 +405,7 @@ export class EscapeEngine {
     finishedAt: 0,
     coarse: -1,
     mid: -1,
-    rate: [] as { t: number; n: number }[],
+    rate: [] as { t: number; n: number; s: number }[],
     trend: [] as { t: number; f: number }[],
     note: undefined as string | undefined,
     sMinLocked: false,
@@ -473,6 +481,9 @@ export class EscapeEngine {
       minEscapedN: this.agg.minN,
       budget: this.budget,
       maxIter: this.maxIter,
+      late: this.agg.late,
+      listMode: this.listMode,
+      patches: this.patchesOn,
     };
   }
 
@@ -737,7 +748,7 @@ export class EscapeEngine {
     // Throughput counts all work, including frames of superseded jobs.
     const now = performance.now();
     const pr = this.prog;
-    pr.rate.push({ t: now, n: c[11] * 256 });
+    pr.rate.push({ t: now, n: c[11] * 256, s: c[14] * 4294967296 + c[13] });
     this.iterationsTotal += c[11] * 256;
     this.stepsTotal += c[14] * 4294967296 + c[13];
     while (pr.rate.length > 2 && now - pr.rate[0].t > 1000) pr.rate.shift();
@@ -837,10 +848,11 @@ export class EscapeEngine {
     const fine = this.converged ? 1 : known ? frac(left - leftCoarse - leftMid, nFine) : 0;
     const sample = this.converged ? 1 : known ? frac(left, pixels) : 0;
     const overall = this.converged ? 1 : Math.min(1, (this.samplesDone + sample) / this.sampleTarget);
-    const rate =
+    const perSecond = (f: (r: { n: number; s: number }) => number) =>
       pr.rate.length > 1 && !this.converged
-        ? pr.rate.slice(1).reduce((s, r) => s + r.n, 0) / Math.max(1e-3, (pr.rate[pr.rate.length - 1].t - pr.rate[0].t) / 1000)
+        ? pr.rate.slice(1).reduce((s, r) => s + f(r), 0) / Math.max(1e-3, (pr.rate[pr.rate.length - 1].t - pr.rate[0].t) / 1000)
         : 0;
+    const rate = perSecond((r) => r.n);
     // ETA from the trend of overall completion over the last few seconds.
     pr.trend.push({ t: now, f: overall });
     while (pr.trend.length > 2 && now - pr.trend[0].t > 3000) pr.trend.shift();
@@ -856,6 +868,7 @@ export class EscapeEngine {
       converged: this.converged,
       moving,
       iterationsPerSecond: rate,
+      stepsPerSecond: perSecond((r) => r.s),
       elapsedS: ((this.converged ? pr.finishedAt : now) - pr.viewStart) / 1000,
       etaS,
       maxIter: this.maxIter,

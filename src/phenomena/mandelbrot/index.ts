@@ -12,7 +12,9 @@ import { DeepCamera, bigScaled, rescale, type DeepPoint } from "../../core/camer
 import { feFromLog2 } from "../../core/floatexp";
 import type { InputFrame } from "../../core/input";
 import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo, ProgressRow } from "../../core/phenomenon";
-import { bigCount, int, percent, pow10FromLog2, seconds } from "../../ui/format";
+import { int, percent, pow10FromLog2, seconds } from "../../ui/format";
+import { formatZoom, log2ZoomFromScale } from "../../ui/location";
+import { iterationRows, pixelRows, stepRows } from "../escape/progress";
 import type { PaletteTexture } from "../../core/palettes";
 import type { GpuContext } from "../../gpu/device";
 import {
@@ -43,7 +45,7 @@ export class Mandelbrot implements Phenomenon {
       '<math><msub><mi>z</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msubsup><mi>z</mi><mi>n</mi><mn>2</mn></msubsup><mo>+</mo><mi>c</mi><mo>,</mo><mspace width="0.6em"/><msub><mi>z</mi><mn>0</mn></msub><mo>=</mo><mn>0</mn></math>',
     description:
       "複素数 c ごとに z を二乗して c を足す操作を繰り返し、値が無限大へ逃げない c の集まり。境界はどこまで拡大しても尽きることのない細部を持ち、その奥には自分自身の小さな写しが無数に潜んでいる。",
-    hints: ["ドラッグ — 移動", "ホイール — 拡大・縮小", "ダブルクリック — その点へ近づく", "V — Voyage（自動で深く潜る）"],
+    controls: [["ダブルクリック", "その点へ近づく"], ["V ／ Space", "Voyage — 深い場所へ自動で潜る（もう一度で止める）"]],
     motion: "voyage",
   };
 
@@ -409,16 +411,28 @@ export class Mandelbrot implements Phenomenon {
 
   progress(): ProgressInfo {
     const e = this.engine.progress();
+    const s = this.engine.stats();
     const orbits = this.orbits;
-    const rows: ProgressRow[] = [];
+    const rows: ProgressRow[] = [...stepRows(e)];
     const MODE_JA = ["f32 で直接計算", "", "摂動法（f32 の差分）", "摂動法（floatexp の差分）"];
-    rows.push({ label: "全体", value: percent(e.overall), bar: e.overall });
-    rows.push({ label: "粗い下描き（1/16 の画素）", value: percent(e.coarse), bar: e.coarse });
-    rows.push({ label: "中間（1/4 の画素）", value: percent(e.mid), bar: e.mid });
-    rows.push({ label: "すべての画素", value: percent(e.fine), bar: e.fine });
-    rows.push({ label: "重ね描き（アンチエイリアス）", value: `${Math.min(e.samplesDone + (e.converged ? 0 : 1), e.sampleTarget)} / ${e.sampleTarget} 枚目` });
+
+    // Where the view is and how precisely it is computed.
+    let group = "位置と精度";
+    rows.push({
+      group, label: "精度モード",
+      value: this.holding ? "基準軌道を待っています（直前の画像を表示中）" : `${MODE_JA[this.mode]} · 画素の幅 2^${this.lastSpacingLog2.toFixed(0)} (${pow10FromLog2(this.lastSpacingLog2)})`,
+    });
+    const [re, im] = this.camera.centerDecimal();
+    rows.push(
+      { group, detail: true, label: "拡大率", value: formatZoom(log2ZoomFromScale(this.camera.log2Scale, this.viewW, this.viewH)) },
+      { group, detail: true, label: "中心（実部）", value: digits(re) },
+      { group, detail: true, label: "中心（虚部）", value: digits(im) },
+      { group, detail: true, label: "座標の保持精度", value: `${int(this.camera.frac)} bit（10 進で約 ${int(this.camera.frac * Math.LOG10E * Math.LN2)} 桁）` },
+      { group, detail: true, label: "深いズーム", value: this.deepAvailable ? "利用可（倍率の上限なし）" : "利用不可（ブラウザ実行のため f32 の範囲まで）" },
+    );
 
     // Reference orbit.
+    group = "基準軌道（任意精度）";
     const p = orbits?.pending;
     const pr = orbits?.progress;
     const o = orbits?.current;
@@ -426,31 +440,50 @@ export class Mandelbrot implements Phenomenon {
       const label = pr.phase === "orbit" ? "計算中" : pr.phase === "bla" ? "BLA 表を構築中" : "転送中";
       const frac = pr.phase === "orbit" ? pr.iterations / Math.max(1, pr.maxIter) : 1;
       rows.push({
-        label: "基準軌道（任意精度）",
+        group, label: "基準軌道（任意精度）",
         value: `${label}　${int(pr.iterations)} / ${int(pr.maxIter)} 反復 · ${int(pr.bits)} bit · ${seconds(pr.elapsedMs / 1000)}`,
         bar: frac,
       });
     } else if (p && p.kind === "bla") {
-      rows.push({ label: "基準軌道（任意精度）", value: "BLA 表を現在の範囲に合わせて再構築中" });
+      rows.push({ group, label: "基準軌道（任意精度）", value: "BLA 表を現在の範囲に合わせて再構築中" });
     } else if (this.mode === MODE_DIRECT && !this.holding) {
-      rows.push({ label: "基準軌道（任意精度）", value: "不要（この倍率では f32 で直接計算）" });
+      rows.push({ group, label: "基準軌道（任意精度）", value: "不要（この倍率では f32 で直接計算）" });
     } else if (o) {
       rows.push({
-        label: "基準軌道（任意精度）",
+        group, label: "基準軌道（任意精度）",
         value: `${int(o.len)} 点 · ${int(o.bits)} bit${o.periodic ? " · 周期点" : ""} · BLA ${o.levels} 段 · ${seconds(o.computeMs / 1000)}`,
       });
     }
-    rows.push({
-      label: "精度モード",
-      value: this.holding ? "基準軌道を待っています（直前の画像を表示中）" : `${MODE_JA[this.mode]} · 画素の幅 2^${this.lastSpacingLog2.toFixed(0)} (${pow10FromLog2(this.lastSpacingLog2)})`,
-    });
-    rows.push({ label: "反復", value: `上限 ${int(e.maxIter)} · 逃げるまでの最大 ${int(e.maxEscaped)}` });
-    if (!e.converged) rows.push({ label: "処理速度", value: `${bigCount(e.iterationsPerSecond)} 反復/秒` });
-    rows.push({
-      label: e.converged ? "完成までの時間" : "経過 / 残り（推定）",
-      value: e.converged ? seconds(e.elapsedS) : `${seconds(e.elapsedS)} / ${e.etaS !== undefined ? "約 " + seconds(e.etaS) : "—"}`,
-    });
-    rows.push({ label: "画素数", value: int(e.pixels) });
+    if (o && this.mode !== MODE_DIRECT) {
+      rows.push(
+        {
+          group, detail: true, label: "軌道の終わり",
+          value: o.escaped ? "基準点が発散した（軌道はここで完結）" : o.periodic ? "周期軌道（0 に戻るので先頭から繰り返す）" : "途中まで（反復上限が伸びれば延長）",
+        },
+        { group, detail: true, label: "軌道の長さ / 反復上限", value: `${int(o.len)} 点 / ${int(e.maxIter)} 反復` },
+        { group, detail: true, label: "BLA 表", value: `${o.levels} 段 · |δc| ≤ 2^${o.dcMaxLog2.toFixed(0)} で有効` },
+        { group, detail: true, label: "基準点の乗り換え（リベース）", value: `${int(s.rebases)} 回（この 1 枚）` },
+        { group, detail: true, label: "BLA で飛ばした回数", value: `${int(s.blaSteps)} 回（この 1 枚）` },
+        { group, detail: true, label: "誤差の兆候（グリッチ）", value: s.anomalies ? `${int(s.anomalies)} 画素で検出・補正` : "なし" },
+        { group, detail: true, label: "成分の証明（内部の高速判定）", value: s.patches ? "この視点に適用中" : "未適用（視点が止まると計算）" },
+      );
+    }
+
+    rows.push(...iterationRows(this.engine, e), ...pixelRows(this.engine, e));
+
+    if (this.voyage) {
+      group = "Voyage";
+      const v = this.voyage;
+      const PHASE_JA = { approach: "目的地へ移動", dive: "潜っている", rest: "最深部で休止", return: "浮上して戻る" };
+      rows.push(
+        { group, detail: true, label: "目的地", value: `${v.target.name}（${v.index + 1} / ${VOYAGES.length}）` },
+        { group, detail: true, label: "段階", value: PHASE_JA[v.phase] },
+        {
+          group, detail: true, label: "目標の深さ",
+          value: `${pow10FromLog2(-v.target.depthLog2)} · 毎秒 ×${(2 ** (v.target.rate ?? 1)).toFixed(2)} で拡大${v.target.period ? ` · 周期 ${v.target.period} の minibrot` : ""}`,
+        },
+      );
+    }
 
     let headline = e.converged ? "完成" : e.moving ? `視点の動きに合わせて毎フレーム描き直し中 — ${percent(e.sample)}` : `計算中 — ${percent(e.overall)}`;
     if (this.holding) headline = "基準軌道を計算中";
@@ -492,4 +525,10 @@ export class Mandelbrot implements Phenomenon {
   dispose(): void {
     this.engine.dispose();
   }
+}
+
+/** A long decimal, shortened for the panel with its full digit count. */
+function digits(x: string): string {
+  const n = x.replace(/^-|\./g, "").length;
+  return x.length > 64 ? `${x.slice(0, 62)}…（全 ${n} 桁、L でコピー）` : x;
 }

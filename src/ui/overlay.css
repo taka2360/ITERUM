@@ -165,30 +165,54 @@ body.hidden-ui #ui > * { opacity: 0 !important; }
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  padding: 34px 46px;
-  background: rgba(6, 7, 11, 0.72);
+  width: min(760px, 92vw);
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 30px 40px 24px;
+  background: rgba(6, 7, 11, 0.78);
   backdrop-filter: blur(10px);
   border: 1px solid rgba(236, 231, 220, 0.08);
   font-family: var(--sans);
   font-size: 12px;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
+  pointer-events: auto;
 }
-#help h2 { margin: 0 0 18px; font-family: var(--serif); font-weight: normal; font-size: 13px; letter-spacing: 0.4em; color: var(--ink-soft); }
-#help dl { display: grid; grid-template-columns: auto auto; gap: 9px 28px; margin: 0; }
-#help dt { color: var(--ink); text-align: right; font-family: var(--serif); }
+#help h2 { margin: 0 0 20px; font-family: var(--serif); font-weight: normal; font-size: 13px; letter-spacing: 0.4em; color: var(--ink-soft); text-align: center; }
+#help .groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 22px 40px; }
+#help section.current { grid-column: 1 / -1; padding-top: 16px; border-top: 1px solid rgba(236, 231, 220, 0.1); }
+#help h3 { margin: 0 0 10px; font-weight: normal; font-size: 10px; letter-spacing: 0.24em; color: var(--ink-faint); }
+#help dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0; align-items: baseline; }
+#help dt { color: var(--ink); white-space: nowrap; }
 #help dd { margin: 0; color: var(--ink-soft); }
+#help kbd {
+  display: inline-block;
+  min-width: 1.2em;
+  padding: 1px 6px;
+  border: 1px solid rgba(236, 231, 220, 0.22);
+  border-radius: 3px;
+  font: 11px var(--sans);
+  text-align: center;
+  color: var(--ink);
+}
+#help .foot { margin: 20px 0 0; font-size: 10px; letter-spacing: 0.16em; color: var(--ink-faint); text-align: center; }
 
 #progress {
   position: absolute;
   top: 26px;
   right: 30px;
   width: min(380px, 80vw);
-  padding: 22px 24px 20px;
+  max-height: calc(100vh - 130px);
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 22px 24px 16px;
   background: rgba(6, 7, 11, 0.66);
   backdrop-filter: blur(10px);
   border: 1px solid rgba(236, 231, 220, 0.08);
   font-family: var(--sans);
   pointer-events: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(236, 231, 220, 0.18) transparent;
 }
 #progress .headline {
   margin: 0 0 16px;
@@ -206,9 +230,46 @@ body.hidden-ui #ui > * { opacity: 0 !important; }
   letter-spacing: 0.04em;
   color: var(--ink-soft);
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 #progress .bar { margin-top: 6px; height: 2px; background: rgba(236, 231, 220, 0.08); }
 #progress .bar > div { height: 100%; background: rgba(236, 231, 220, 0.6); transition: width 0.25s linear; }
+#progress .foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(236, 231, 220, 0.07);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--ink-faint);
+}
+#progress .mode {
+  padding: 3px 9px;
+  border: 1px solid rgba(236, 231, 220, 0.16);
+  background: none;
+  color: var(--ink-soft);
+  font: inherit;
+  cursor: pointer;
+}
+#progress .mode:hover { color: var(--ink); border-color: rgba(236, 231, 220, 0.3); }
+
+/* Detailed view: wider, every figure, label and value side by side under group headings. */
+#progress.detail { width: min(560px, 92vw); max-height: calc(100vh - 52px); }
+#progress.detail .heading {
+  margin: 18px 0 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid rgba(236, 231, 220, 0.07);
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  color: var(--ink-soft);
+}
+#progress.detail .rows > .heading:first-child { margin-top: 0; }
+#progress.detail .row { display: grid; grid-template-columns: 11.5em 1fr; column-gap: 14px; margin-top: 6px; align-items: baseline; }
+#progress.detail .value { margin-top: 0; font-size: 11.5px; }
+#progress.detail .bar { grid-column: 2; margin-top: 4px; }
 
 #progressline {
   position: absolute;
