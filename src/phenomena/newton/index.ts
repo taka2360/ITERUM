@@ -6,12 +6,12 @@ import { numberToDecimal } from "../../ui/location";
 import type { InputFrame } from "../../core/input";
 import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo } from "../../core/phenomenon";
 import { int } from "../../ui/format";
-import { hexToRgb, type PaletteTexture } from "../../core/palettes";
+import { distinctPositions, hexToRgb, type PaletteTexture } from "../../core/palettes";
 import { shaderModule, type GpuContext } from "../../gpu/device";
 import { wgsl } from "../../shaders";
 import src from "./newton.wgsl?raw";
 
-const UNIFORM_BYTES = 128;
+const UNIFORM_BYTES = 160;
 
 interface Preset {
   name: string;
@@ -206,6 +206,7 @@ export class Newton implements Phenomenon {
       f[8] = palOffset; u[9] = 64; f[10] = 0.6;
       roots.forEach(([x, y], k) => { f[12 + 2 * k] = x; f[13 + 2 * k] = y; });
       f[28] = interior[0]; f[29] = interior[1]; f[30] = interior[2]; f[31] = 1;
+      this.basinHues(pal, roots.length).forEach((t, k) => { f[32 + k] = t; });
       device.queue.writeBuffer(this.uniform, 0, buf);
       const pass = frame.encoder.beginRenderPass({
         label: "newton",
@@ -221,6 +222,15 @@ export class Newton implements Phenomenon {
   }
 
   private lastFrame = { samples: 4, pixels: 0, paused: false };
+
+  private hueCache = { key: "", hues: [] as number[] };
+
+  /** Palette positions of the basin colours (recomputed only when the palette or root count changes). */
+  private basinHues(pal: PaletteTexture, n: number): number[] {
+    const key = `${pal.index}:${n}`;
+    if (this.hueCache.key !== key) this.hueCache = { key, hues: distinctPositions(pal.palette, n) };
+    return this.hueCache.hues;
+  }
 
   progress(): ProgressInfo {
     const f = this.lastFrame;

@@ -14,8 +14,9 @@ export const PALETTES: Palette[] = [
   {
     name: "Nocturne",
     stops: [
-      [0.0, "#03050b"], [0.17, "#0c1c36"], [0.36, "#28537c"], [0.52, "#9cc0d8"],
-      [0.61, "#f2ead8"], [0.71, "#d9a35f"], [0.84, "#5e2f45"], [1.0, "#03050b"],
+      [0.0, "#040613"], [0.14, "#0d1f47"], [0.3, "#094e8c"], [0.44, "#4097bd"],
+      [0.54, "#acdbe3"], [0.61, "#faf1df"], [0.69, "#f5c076"], [0.77, "#d77343"],
+      [0.86, "#89334c"], [0.94, "#32153e"], [1.0, "#040613"],
     ],
     interior: "#020306",
     background: "#03040a",
@@ -23,8 +24,9 @@ export const PALETTES: Palette[] = [
   {
     name: "Ember",
     stops: [
-      [0.0, "#080403"], [0.2, "#2b100b"], [0.4, "#6f2b17"], [0.56, "#c8742f"],
-      [0.68, "#f4d39b"], [0.75, "#fbf3e0"], [0.88, "#7c3f25"], [1.0, "#080403"],
+      [0.0, "#0f0302"], [0.16, "#430709"], [0.32, "#892312"], [0.46, "#cb5906"],
+      [0.58, "#f4a437"], [0.67, "#fbe2a7"], [0.73, "#fbf5df"], [0.82, "#de8f57"],
+      [0.91, "#7b2432"], [1.0, "#0f0302"],
     ],
     interior: "#040202",
     background: "#060302",
@@ -32,8 +34,9 @@ export const PALETTES: Palette[] = [
   {
     name: "Verdigris",
     stops: [
-      [0.0, "#020707"], [0.2, "#0b2a2a"], [0.4, "#1f5f5a"], [0.56, "#7fb8a4"],
-      [0.67, "#e8efe0"], [0.77, "#c9b37a"], [0.89, "#3d4c33"], [1.0, "#020707"],
+      [0.0, "#000a0b"], [0.16, "#032d2f"], [0.32, "#06625f"], [0.46, "#3ba888"],
+      [0.56, "#a6daaf"], [0.63, "#eff1da"], [0.71, "#e4c87c"], [0.8, "#b38236"],
+      [0.9, "#24462c"], [1.0, "#000a0b"],
     ],
     interior: "#010404",
     background: "#020505",
@@ -41,8 +44,8 @@ export const PALETTES: Palette[] = [
   {
     name: "Graphite",
     stops: [
-      [0.0, "#050506"], [0.22, "#1c1c21"], [0.42, "#4a4a54"], [0.58, "#a8a29a"],
-      [0.68, "#efe4c8"], [0.78, "#c8a050"], [0.9, "#4f3c1c"], [1.0, "#050506"],
+      [0.0, "#060607"], [0.22, "#1c1c22"], [0.42, "#484954"], [0.58, "#a7a097"],
+      [0.68, "#efe4c7"], [0.78, "#d2a249"], [0.9, "#543a19"], [1.0, "#060607"],
     ],
     interior: "#030303",
     background: "#040405",
@@ -50,8 +53,9 @@ export const PALETTES: Palette[] = [
   {
     name: "Aurora",
     stops: [
-      [0.0, "#04030a"], [0.2, "#1b1240"], [0.38, "#3b3f9a"], [0.53, "#4fa3b8"],
-      [0.64, "#c9f0e4"], [0.72, "#f7e9ff"], [0.86, "#7c55a8"], [1.0, "#04030a"],
+      [0.0, "#060313"], [0.15, "#22125a"], [0.3, "#373ba7"], [0.43, "#0886b0"],
+      [0.53, "#2ac3bb"], [0.61, "#acefd1"], [0.68, "#fbecff"], [0.77, "#e18fc6"],
+      [0.87, "#8c399e"], [0.94, "#34125a"], [1.0, "#060313"],
     ],
     interior: "#020106",
     background: "#03020a",
@@ -128,6 +132,35 @@ export function paletteMean(p: Palette): [number, number, number] {
   const m = [0, 0, 0];
   for (let i = 0; i < LUT_SIZE; i++) for (let c = 0; c < 3; c++) m[c] += lut[i * 4 + c] / 255;
   return [m[0] / LUT_SIZE, m[1] / LUT_SIZE, m[2] / LUT_SIZE];
+}
+
+/**
+ * Positions of `n` vivid, mutually distinct colours of a palette (for basins
+ * that each need their own colour). Greedy: the most chromatic mid-light
+ * colour first, then each next one as far as possible from those chosen,
+ * weighted by its own chroma, so pale and near-black stops are avoided.
+ */
+export function distinctPositions(p: Palette, n: number): number[] {
+  const N = 256;
+  const cand: { t: number; lab: Vec3; c: number }[] = [];
+  for (let i = 0; i < N; i++) {
+    const lab = srgbToOklab(samplePalette(p, i / N));
+    const c = Math.hypot(lab[1], lab[2]);
+    if (lab[0] > 0.4 && lab[0] < 0.85) cand.push({ t: i / N, lab, c });
+  }
+  if (cand.length === 0) return Array.from({ length: n }, (_, k) => 0.32 + (0.46 * k) / Math.max(n - 1, 1));
+  const chosen = [cand.reduce((a, b) => (b.c > a.c ? b : a))];
+  while (chosen.length < n) {
+    let best = cand[0];
+    let bestScore = -1;
+    for (const x of cand) {
+      const d = Math.min(...chosen.map((y) => Math.hypot(x.lab[0] - y.lab[0], x.lab[1] - y.lab[1], x.lab[2] - y.lab[2])));
+      const score = d * d * (0.02 + x.c);
+      if (score > bestScore) { bestScore = score; best = x; }
+    }
+    chosen.push(best);
+  }
+  return chosen.map((x) => x.t).sort((a, b) => a - b);
 }
 
 /** GPU texture + sampler for the active palette, shared by all phenomena. */

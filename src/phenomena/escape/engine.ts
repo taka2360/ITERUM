@@ -237,7 +237,7 @@ export class EscapeEngine {
   movingMaxMs = 9;
   private frameMsAvg = 16.7;
   /** density: palette cycles per doubling of (iterations − sMin)/bandScale. */
-  look = { offset: 0, density: 0.32, glow: 0.6, sMin: 0, bandScale: 6, interiorGlow: 0.3 };
+  look = { offset: 0, density: 0.32, glow: 0.6, sMin: 0, bandScale: 6, interiorGlow: 0.3, relief: 0.2 };
 
   private agg = { escaped: 0, interior: 0, anomalies: 0, rebases: 0, blaSteps: 0, maxN: 0, minN: Infinity, late: 0, unfinished: -1, cycling: 0, proven: 0 };
   /** Aggregated statistics of the most recently completed sample. */
@@ -656,7 +656,7 @@ export class EscapeEngine {
     df[8] = this.look.offset; df[9] = this.look.density; df[10] = this.look.sMin; df[11] = this.look.glow;
     df[12] = interior[0]; df[13] = interior[1]; df[14] = interior[2]; df[15] = 1;
     df[16] = palTex.mean[0]; df[17] = palTex.mean[1]; df[18] = palTex.mean[2]; df[19] = this.look.bandScale;
-    df[20] = this.look.interiorGlow;
+    df[20] = this.look.interiorGlow; df[21] = this.look.relief;
     device.queue.writeBuffer(this.displayParams, 0, dbuf);
     this.outIndex = 1 - this.outIndex;
     const target = this.outputs[this.outIndex];
