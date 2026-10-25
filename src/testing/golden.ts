@@ -89,6 +89,8 @@ export interface GoldenResult {
   gpuEscapeMs: number;
   frames: number;
   maxIter: number;
+  /** Colour reference (fastest coarse escape); must not vary between runs. */
+  sMin: number;
   restarts: number;
   iterations: number;
   escaped: number;
@@ -214,6 +216,7 @@ export async function renderGolden(app: App, gv: GoldenView, orbits: OrbitManage
       gpuEscapeMs: +gpuMs.toFixed(1),
       frames,
       maxIter: engine.maxIter,
+      sMin: engine.look.sMin,
       restarts: engine.restarts,
       iterations: engine.iterationsTotal,
       escaped: s.escaped,

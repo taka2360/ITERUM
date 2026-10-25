@@ -128,7 +128,8 @@ const C_RAISED_NOW = 19;
 const C_FRAME_MAX_ITER = 20;
 const C_AGG = 21; // escaped, late, interior, cycling, proven
 const C_RAISE = 26; // escaped, late, paused at the latest raise
-const COUNTER_BYTES = 29 * 4;
+const C_MIN_COARSE = 29;
+const COUNTER_BYTES = 30 * 4;
 // Coefficients of the closed-form interior tests (interior.ts).
 const TERM_BYTES = 21 * 16;
 // Component proofs (component.rs): one record per tile of an 8 × 8 grid.
@@ -591,6 +592,7 @@ export class EscapeEngine {
       cw[6] = 0xffffffff;
       if (words > FRAME_WORDS) {
         cw[C_MAX_ITER] = cw[C_FRAME_MAX_ITER] = this.maxIter;
+        cw[C_MIN_COARSE] = 0xffffffff;
         this.countersJob = this.job;
         this.raisesSeen = 0;
       }
@@ -764,10 +766,12 @@ export class EscapeEngine {
     pr.mid = c[10];
     const a = this.agg;
     if (c[6] !== 0xffffffff) a.minN = Math.min(a.minN, c[6]);
-    // Fix the colour reference (fastest escape) while the coarse preview is
-    // still being drawn, so colours never shift when the image completes.
-    if (this.sample === 0 && !pr.sMinLocked && a.minN !== Infinity) {
-      this.look.sMin = a.minN;
+    // Fix the colour reference (fastest escape among the coarse pixels) once
+    // the coarse preview is done, so colours never shift when the image
+    // completes. The GPU keeps the minimum for the whole job, so it is the
+    // same on every run of the view.
+    if (this.sample === 0 && !pr.sMinLocked && c[C_MIN_COARSE] !== 0xffffffff) {
+      this.look.sMin = c[C_MIN_COARSE];
       if (c[9] === 0) pr.sMinLocked = true;
     }
     a.unfinished = c[0];

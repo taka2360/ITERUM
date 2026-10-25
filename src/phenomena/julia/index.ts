@@ -44,7 +44,6 @@ export class Julia implements Phenomenon {
   private velocity: [number, number] = [0, 0];
   private prev?: { cx: number; cy: number; s: number; pr: number; c: [number, number] };
   private needsHome = true;
-  private drift = 0;
 
   constructor(palette: () => PaletteTexture) {
     this.engine = new EscapeEngine(palette);
@@ -128,7 +127,6 @@ export class Julia implements Phenomenon {
     if (!ctx.paused) {
       // One revolution every ~3 minutes, with a slow radial breath.
       this.theta += dt * 0.035;
-      this.drift += dt * 0.006;
     }
     // Hover around the boundary, slightly more often just outside it, where
     // the set breaks into spirals and dust.
@@ -151,7 +149,6 @@ export class Julia implements Phenomenon {
       history = { scale: 2 ** (s - p.s), offset: [(cam.cx - p.cx) / sp, -(cam.cy - p.cy) / sp] };
     }
     this.prev = { cx: cam.cx, cy: cam.cy, s, pr: frame.pixelRatio, c: [...this.c] };
-    this.engine.look.offset = this.drift;
     this.engine.setView(
       { mode: MODE_JULIA, spacing: feFromLog2(s), center: [cam.cx, cam.cy], cmr: [0, 0], juliaC: this.c },
       history,
