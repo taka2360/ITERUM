@@ -144,6 +144,9 @@ struct Counters {
   raise_escaped: u32,
   raise_late: u32,
   raise_paused: u32,
+  // Fewest iterations of an escaped step-0 pixel in this job: the colour
+  // reference, independent of timing and of which frames the CPU reads back.
+  agg_min_coarse: atomic<u32>,
 }
 
 var<workgroup> wg_iterations: atomic<u32>;
@@ -236,6 +239,7 @@ fn finish_escaped(s: ptr<function, PixelState>, idx: u32, z: vec2<f32>, log2_g: 
   atomicAdd(&counters.escaped, 1u);
   atomicMax(&counters.max_escaped_n, (*s).n);
   atomicMin(&counters.min_escaped_n, (*s).n);
+  if (step_of(vec2<u32>(idx % P.size.x, idx / P.size.x)) == 0u) { atomicMin(&counters.agg_min_coarse, (*s).n); }
   if ((*s).n > max_iter / 2u) { atomicAdd(&counters.late_escapes, 1u); }
 }
 

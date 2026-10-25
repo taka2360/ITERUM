@@ -540,6 +540,36 @@ async function testColourStability(app: App): Promise<void> {
   report("colour-stability", ok, notes.join("; "));
 }
 
+/** Opening the same view again must give the same colour reference (sMin). */
+async function testColourRepeat(app: App): Promise<void> {
+  app.select(0);
+  await seconds(1);
+  const m = app.phenomena[0] as import("../phenomena/mandelbrot").Mandelbrot;
+  const engine = (m as unknown as { engine: { look: { sMin: number } } }).engine;
+  const views: [string, string, number][] = [
+    ["-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", Math.log2(1e-12)],
+    [VOYAGES[2].re, VOYAGES[2].im, -VOYAGES[2].depthLog2 + 3],
+  ];
+  let ok = true;
+  const notes: string[] = [];
+  for (const [re, im, w] of views) {
+    const seen: number[] = [];
+    for (let run = 0; run < 3; run++) {
+      // Away and back, so each run starts the view from nothing.
+      m.setView("-0.6", "0", Math.log2(3.6) - Math.log2(app.canvas.width));
+      await frames(app, 10);
+      m.setView(re, im, w - Math.log2(app.canvas.width));
+      await frames(app, 10);
+      const t0 = performance.now();
+      while (performance.now() - t0 < 30000 && m.progress().fraction !== 1) await frames(app, 1);
+      seen.push(engine.look.sMin);
+    }
+    if (seen.some((x) => x !== seen[0])) ok = false;
+    notes.push(`sMin ${seen.join(", ")}`);
+  }
+  report("colour-repeat", ok, notes.join("; "));
+}
+
 // ---- progress reporting --------------------------------------------------------
 
 async function testProgress(app: App): Promise<void> {
@@ -601,6 +631,7 @@ export async function runGpuTests(app: App): Promise<void> {
   steps.push(["controls", () => testControls(app)]);
   steps.push(["progress", () => testProgress(app)]);
   steps.push(["colour", () => testColourStability(app)]);
+  steps.push(["colour-repeat", () => testColourRepeat(app)]);
   steps.push(["device-loss", () => testDeviceLoss(app)]);
   const only = await envVar("ITERUM_ONLY");
   for (const [name, fn] of only ? steps.filter(([n]) => only.split(",").includes(n)) : steps) {

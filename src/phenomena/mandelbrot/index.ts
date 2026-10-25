@@ -63,7 +63,6 @@ export class Mandelbrot implements Phenomenon {
   private mode: EscapeMode = MODE_DIRECT;
   private holding = false;
   private needsHome = true;
-  private paletteDrift = 0;
   private lastSpacingLog2 = 0;
   // Component proofs (orbit.ts, requestPatches): the view they are for, when
   // it last changed, and whether they were requested.
@@ -254,8 +253,6 @@ export class Mandelbrot implements Phenomenon {
     // Zooming out past the overview is pointless; ease back.
     const maxScale = Math.log2(8 / Math.max(1, Math.min(ctx.viewW, ctx.viewH)));
     if (cam.log2Scale > maxScale) cam.zoomAt(0, 0, cam.log2Scale - maxScale);
-
-    if (!ctx.paused) this.paletteDrift += dt * 0.004;
   }
 
   private updateVoyage(dt: number): void {
@@ -355,7 +352,6 @@ export class Mandelbrot implements Phenomenon {
       }
     }
     this.mode = view.mode;
-    this.engine.look.offset = this.paletteDrift;
     if (this.holding) {
       this.engine.setView(view, history ?? { scale: 1, offset: [0, 0] });
       return this.engine.render(frame, false);
