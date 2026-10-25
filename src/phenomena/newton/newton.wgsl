@@ -15,6 +15,7 @@ struct U {
   _pad: f32,
   roots: array<vec4<f32>, 4>,   // up to 8 roots, two per vec4
   interior: vec4<f32>,
+  hues: array<vec4<f32>, 2>,    // palette position of each root's colour
 }
 
 @group(0) @binding(0) var<uniform> P: U;
@@ -56,14 +57,16 @@ fn sample_at(z0: vec2<f32>) -> vec3<f32> {
       var frac = 0.0;
       if (n > 0u && lp > ld) { frac = clamp((lt - lp) / (ld - lp), 0.0, 1.0); }
       let t = max(f32(n) - 1.0 + frac, 0.0);
-      // Basin colours come from the luminous middle of the palette, spread evenly.
-      let hue = 0.32 + 0.46 * f32(hit) / max(f32(P.roots_n) - 1.0, 1.0);
-      let base = textureSampleLevel(palette, pal_sampler, vec2<f32>(hue + 0.012 * t + P.pal_offset, 0.5), 0.0).rgb;
+      // Each basin takes its own vivid colour of the palette.
+      let hue = P.hues[hit / 4u][hit % 4u];
+      let base = textureSampleLevel(palette, pal_sampler, vec2<f32>(hue + 0.005 * t + P.pal_offset, 0.5), 0.0).rgb;
       // Points that settle quickly sink into shadow; slow ones, near basin
-      // boundaries, carry the colour and a soft light.
+      // boundaries, carry the colour and a soft light. The shadow deepens the
+      // colour (a power curve) before darkening it, so pale basins turn to
+      // deep tones of their own hue instead of grey.
       let g = 1.0 - exp(-0.18 * t);
       let shade = 0.07 + 0.93 * smoothstep(0.0, 1.0, g);
-      let col = mix(P.interior.rgb, base, shade);
+      let col = mix(P.interior.rgb, pow(base, vec3<f32>(1.0 + 2.5 * (1.0 - shade))), shade);
       return col + sqrt(base) * P.glow * pow(g, 6.0) * 0.5;
     }
     prev = z;
