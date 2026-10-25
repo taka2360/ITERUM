@@ -16,8 +16,8 @@ export interface PhenomenonMeta {
   formula: string;
   /** One or two sentences shown on demand. */
   description: string;
-  /** Short interaction hints shown in the help overlay. */
-  hints: string[];
+  /** Controls particular to this phenomenon, [key or gesture, effect], listed in the help panel. */
+  controls: [string, string][];
   /**
    * What the play control does: "animation" pauses/resumes the phenomenon's
    * own motion; "voyage" starts/stops an automatic journey (setPlaying).
@@ -48,6 +48,10 @@ export interface ProgressRow {
   value: string;
   /** Optional 0..1 bar drawn under the value. */
   bar?: number;
+  /** Section heading; consecutive rows with the same group share it (detailed view). */
+  group?: string;
+  /** Shown only in the detailed view. */
+  detail?: boolean;
 }
 
 /** What the progress panel shows for the active phenomenon. */

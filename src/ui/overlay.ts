@@ -1,29 +1,13 @@
 // The quiet layer over the image: caption, formula, description, selector,
 // help and debug. Everything fades away after a few seconds without input.
 
-import type { PhenomenonMeta } from "../core/phenomenon";
+import type { PhenomenonMeta, ProgressRow } from "../core/phenomenon";
+import { KEY_GROUPS } from "./keys";
 import { parseLocationText } from "./location";
 
 const IDLE_MS = 3500;
 
-const KEYS: [string, string][] = [
-  ["← →", "現象を切り替える"],
-  ["ドラッグ", "移動 ／ 回転"],
-  ["ホイール", "拡大・縮小"],
-  ["ダブルクリック", "その点へ近づく"],
-  ["右ドラッグ", "パラメータを動かす（ジュリア集合）"],
-  ["V", "Voyage — 自動で深く潜る（マンデルブロ集合）"],
-  ["Space", "再生 ／ 停止（マンデルブロ集合では Voyage）"],
-  ["C", "配色を変える"],
-  ["F", "全画面"],
-  ["I", "解説"],
-  ["L", "現在地 — 座標と拡大率の表示・コピー・移動"],
-  ["H", "表示をすべて隠す"],
-  ["R", "視点を戻す"],
-  ["Q", "品質（自動・低・中・高）"],
-  ["P", "計算の進み具合"],
-  ["D", "計測情報"],
-];
+export type PanelId = "info" | "help" | "debug" | "progress" | "location";
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
 
@@ -40,24 +24,20 @@ export class Overlay {
   /** The location fields hold the user's edits; live updates pause until Enter or Esc. */
   private locationDirty = false;
   private controlsKey = "";
+  /** The progress panel shows a summary or every figure (P cycles summary → detail → closed). */
+  progressDetail = false;
+  private phenomenonCount = 0;
 
   constructor() {
     for (const id of ["#mark", "#caption", "#info", "#notice", "#controls"]) $(id).classList.add("fades");
     $("#play").addEventListener("click", () => this.onPlay());
     $("#reset").addEventListener("click", () => this.onReset());
-    $("#progress-toggle").addEventListener("click", () => this.toggle("progress"));
+    $("#progress-toggle").addEventListener("click", () => this.cycleProgress());
     $("#location-toggle").addEventListener("click", () => this.toggle("location"));
     this.initLocation();
     // Buttons must not keep keyboard focus (Space would click them again).
-    for (const id of ["#play", "#reset", "#progress-toggle", "#location-toggle", "#loc-copy", "#loc-go"]) $(id).addEventListener("pointerup", (e) => (e.currentTarget as HTMLElement).blur());
-    const dl = $("#help").querySelector("dl")!;
-    for (const [k, v] of KEYS) {
-      const dt = document.createElement("dt");
-      dt.textContent = k;
-      const dd = document.createElement("dd");
-      dd.textContent = v;
-      dl.append(dt, dd);
-    }
+    for (const id of ["#play", "#reset", "#progress-toggle", "#location-toggle", "#loc-copy", "#loc-go", "#progress .mode"]) $(id).addEventListener("pointerup", (e) => (e.currentTarget as HTMLElement).blur());
+    $("#progress .mode").addEventListener("click", () => this.setProgressDetail(!this.progressDetail));
     window.addEventListener("pointermove", (e) => {
       this.wake();
       const near = e.clientY > window.innerHeight - 120;
@@ -67,6 +47,7 @@ export class Overlay {
   }
 
   setPhenomena(list: PhenomenonMeta[]): void {
+    this.phenomenonCount = list.length;
     this.selector.replaceChildren(
       ...list.map((m, i) => {
         const b = document.createElement("button");
@@ -88,7 +69,41 @@ export class Overlay {
       cap.style.opacity = "";
     }, 500);
     this.selector.querySelectorAll("button").forEach((b, i) => b.classList.toggle("active", i === index));
+    this.renderHelp(meta);
     this.wake();
+  }
+
+  /** The shortcut list: the common groups, then what only the current phenomenon has. */
+  private renderHelp(meta: PhenomenonMeta): void {
+    const groups = KEY_GROUPS.map((g) => ({
+      title: g.title,
+      items: g.items.map((it): [string, string] => [it.action === "number" ? `1–${this.phenomenonCount}` : it.label, it.text]),
+    }));
+    groups.push({ title: `この現象だけの操作 — ${meta.titleJa}`, items: meta.controls });
+    const box = $("#help .groups");
+    box.replaceChildren(
+      ...groups.map((g) => {
+        const sec = document.createElement("section");
+        const h = document.createElement("h3");
+        h.textContent = g.title;
+        const dl = document.createElement("dl");
+        for (const [k, v] of g.items) {
+          const dt = document.createElement("dt");
+          for (const part of k.split(" ／ ")) {
+            if (dt.childElementCount) dt.append(" ");
+            const kbd = document.createElement("kbd");
+            kbd.textContent = part;
+            dt.append(kbd);
+          }
+          const dd = document.createElement("dd");
+          dd.textContent = v;
+          dl.append(dt, dd);
+        }
+        sec.append(h, dl);
+        if (g === groups[groups.length - 1]) sec.classList.add("current");
+        return sec;
+      }),
+    );
   }
 
   /** Play button: pause/play icon for animations, a labelled toggle for Voyage. */
@@ -121,20 +136,55 @@ export class Overlay {
     }, IDLE_MS);
   }
 
-  toggle(id: "info" | "help" | "debug" | "progress" | "location"): boolean {
+  toggle(id: PanelId): boolean {
+    return this.setOpen(id, $("#" + id).hidden);
+  }
+
+  setOpen(id: PanelId, open: boolean): boolean {
     const el = $("#" + id);
-    el.hidden = !el.hidden;
-    if (id === "progress" || id === "location") $(`#${id}-toggle`).classList.toggle("on", !el.hidden);
-    if (id === "location" && el.hidden) this.leaveLocationEdit();
+    el.hidden = !open;
+    if (id === "progress" || id === "location") $(`#${id}-toggle`).classList.toggle("on", open);
+    if (id === "location" && !open) this.leaveLocationEdit();
+    if (id === "progress" && !open) this.setProgressDetail(false);
     this.wake();
-    return !el.hidden;
+    return open;
+  }
+
+  /** P and the panel button: closed → summary → detail → closed. */
+  cycleProgress(): void {
+    if (!this.isOpen("progress")) this.setOpen("progress", true);
+    else if (!this.progressDetail) this.setProgressDetail(true);
+    else this.setOpen("progress", false);
+  }
+
+  setProgressDetail(on: boolean): void {
+    this.progressDetail = on;
+    const panel = $("#progress");
+    panel.classList.toggle("detail", on);
+    panel.querySelector(".mode")!.textContent = on ? "概要に戻す" : "詳細を見る";
+    this.progressRefresh();
+  }
+
+  /** Asks the app for fresh figures right away (set by main.ts). */
+  progressRefresh: () => void = () => {};
+
+  /** Closes every open panel; returns false if none was open. */
+  closePanels(): boolean {
+    let any = false;
+    for (const id of ["help", "progress", "location", "info", "debug"] as const) {
+      if (!$("#" + id).hidden) {
+        this.setOpen(id, false);
+        any = true;
+      }
+    }
+    return any;
   }
 
   toggleHidden(): void {
     document.body.classList.toggle("hidden-ui");
   }
 
-  isOpen(id: "debug" | "progress" | "location"): boolean {
+  isOpen(id: PanelId): boolean {
     return !$("#" + id).hidden;
   }
 
@@ -175,24 +225,44 @@ export class Overlay {
     }
   }
 
-  setProgress(headline: string, rows: { label: string; value: string; bar?: number }[]): void {
+  /**
+   * Fills the progress panel. The summary shows rows without `detail`; the
+   * detailed view shows every row under its group heading.
+   */
+  setProgress(headline: string, rows: ProgressRow[]): void {
     const panel = $("#progress");
     panel.querySelector(".headline")!.textContent = headline;
     const box = panel.querySelector(".rows") as HTMLElement;
-    while (box.children.length < rows.length) {
-      const r = document.createElement("div");
-      r.className = "row";
-      r.innerHTML = '<div class="label"></div><div class="value"></div><div class="bar"><div></div></div>';
-      box.append(r);
+    const shown = this.progressDetail ? rows : rows.filter((r) => !r.detail);
+    // Group headings become rows of their own so the list can be reused in place.
+    const items: ({ heading: string } | ProgressRow)[] = [];
+    let group: string | undefined;
+    for (const r of shown) {
+      if (this.progressDetail && r.group && r.group !== group) items.push({ heading: r.group });
+      group = r.group;
+      items.push(r);
     }
-    while (box.children.length > rows.length) box.lastElementChild!.remove();
-    rows.forEach((row, i) => {
-      const el = box.children[i] as HTMLElement;
-      (el.querySelector(".label") as HTMLElement).textContent = row.label;
-      (el.querySelector(".value") as HTMLElement).textContent = row.value;
+    while (box.children.length < items.length) box.append(document.createElement("div"));
+    while (box.children.length > items.length) box.lastElementChild!.remove();
+    items.forEach((item, i) => {
+      let el = box.children[i] as HTMLElement;
+      const kind = "heading" in item ? "heading" : "row";
+      if (el.className !== kind) {
+        const fresh = document.createElement("div");
+        fresh.className = kind;
+        if (kind === "row") fresh.innerHTML = '<div class="label"></div><div class="value"></div><div class="bar"><div></div></div>';
+        el.replaceWith(fresh);
+        el = fresh;
+      }
+      if ("heading" in item) {
+        el.textContent = item.heading;
+        return;
+      }
+      (el.querySelector(".label") as HTMLElement).textContent = item.label;
+      (el.querySelector(".value") as HTMLElement).textContent = item.value;
       const bar = el.querySelector(".bar") as HTMLElement;
-      bar.hidden = row.bar === undefined;
-      if (row.bar !== undefined) (bar.firstElementChild as HTMLElement).style.width = `${(Math.max(0, Math.min(1, row.bar)) * 100).toFixed(1)}%`;
+      bar.hidden = item.bar === undefined;
+      if (item.bar !== undefined) (bar.firstElementChild as HTMLElement).style.width = `${(Math.max(0, Math.min(1, item.bar)) * 100).toFixed(1)}%`;
     });
   }
 

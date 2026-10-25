@@ -20,7 +20,7 @@
       <nav id="selector"></nav>
       <nav id="controls">
         <button id="play" type="button"></button>
- <button id="progress-toggle" type="button" title="計算の進み具合（P）" aria-label="計算の進み具合">
+        <button id="progress-toggle" type="button" title="計算の様子 — 概要 → 詳細 → 閉じる（P）" aria-label="計算の様子">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18V12" /><path d="M10 18V7" /><path d="M15 18v-8" /><path d="M20 18V5" /></svg>
         </button>
         <button id="location-toggle" type="button" title="現在地 — 座標と拡大率（L）" aria-label="現在地">
@@ -45,12 +45,14 @@
       <aside id="toast"></aside>
       <section id="help" hidden>
         <h2>操作</h2>
-        <dl></dl>
+        <div class="groups"></div>
+        <p class="foot">? または Esc で閉じる</p>
       </section>
       <pre id="debug" hidden></pre>
       <section id="progress" hidden aria-live="polite">
         <h2 class="headline"></h2>
         <div class="rows"></div>
+        <div class="foot"><span>P で 概要 → 詳細 → 閉じる</span><button class="mode" type="button">詳細を見る</button></div>
       </section>
       <div id="progressline"><div class="fill"></div></div>
       <section id="unsupported" hidden>

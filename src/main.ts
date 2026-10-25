@@ -7,14 +7,20 @@ import { Compositor } from "./gpu/compositor";
 import { InputCollector } from "./core/input";
 import { PaletteTexture, PALETTES } from "./core/palettes";
 import { createPhenomena } from "./core/registry";
-import type { Phenomenon } from "./core/phenomenon";
+import type { Phenomenon, ProgressRow } from "./core/phenomenon";
 import { Overlay } from "./ui/overlay";
-import { diag, launchMode, toggleFullscreen } from "./platform";
+import { diag, exitFullscreen, launchMode, toggleFullscreen } from "./platform";
+import { keyBinding } from "./ui/keys";
 import { formatZoom, locationText, log2ScaleFromZoom, log2ZoomFromScale, normalizeDecimal, parseZoom, type Location } from "./ui/location";
 
 const TRANSITION_S = 1.6;
 const QUALITY_ORDER: QualityMode[] = ["auto", "low", "medium", "high"];
 const QUALITY_NAMES: Record<QualityMode, string> = { auto: "品質：自動", low: "品質：低", medium: "品質：中", high: "品質：高" };
+/** GPU timer pass names as the progress panel shows them. */
+const PASS_NAMES: Record<string, string> = {
+  escape: "反復計算", display: "着色", composite: "合成と表示", newton: "ニュートン法",
+  "lorenz-integrate": "粒子の積分", "lorenz-display": "粒子の描画", "lorenz-decay": "残光の減衰",
+};
 
 export class App {
   gpu!: GpuContext;
@@ -55,6 +61,7 @@ export class App {
     this.overlay.onReset = () => this.resetView();
     this.overlay.onLocationGo = (re, im, zoom) => this.goTo(re, im, zoom);
     this.overlay.onLocationCopy = () => this.copyLocation();
+    this.overlay.progressRefresh = () => (this.lastProgressUpdate = 0);
     window.addEventListener("keydown", (e) => this.onKey(e));
     new ResizeObserver(() => this.resize()).observe(canvas);
     this.resize();
@@ -221,39 +228,43 @@ export class App {
     this.syncControls();
   }
 
+  /** Keys come from the table in ui/keys.ts; the active phenomenon sees each key first. */
   private onKey(e: KeyboardEvent): void {
     // Typing in a text field (location panel) is not a shortcut.
     if (e.target instanceof HTMLInputElement) return;
-    if (e.repeat && !["ArrowLeft", "ArrowRight"].includes(e.key)) return;
+    if (e.ctrlKey || e.altKey || e.metaKey) return;
+    const binding = keyBinding(e.key);
+    if (e.repeat && !binding?.repeat) return;
     this.overlay.wake();
     if (this.active.onKey?.(e.key)) return;
-    switch (e.key) {
-      case "ArrowRight": this.select(this.index + 1); break;
-      case "ArrowLeft": this.select(this.index - 1); break;
-      case "f": case "F": case "F11": e.preventDefault(); toggleFullscreen(); break;
-      case "Escape": if (document.fullscreenElement) document.exitFullscreen(); break;
-      case " ": e.preventDefault(); this.togglePlay(); break;
-      case "r": case "R": this.resetView(); break;
-      case "c": case "C": this.palette.set(this.palette.index + 1); this.overlay.toast(`配色：${PALETTES[this.palette.index].name}`); break;
-      case "h": case "H": this.overlay.toggleHidden(); break;
-      case "i": case "I": this.overlay.toggle("info"); break;
-      case "?": case "/": this.overlay.toggle("help"); break;
-      case "d": case "D": this.overlay.toggle("debug"); break;
-      case "p": case "P": this.overlay.toggle("progress"); this.lastProgressUpdate = 0; break;
-      case "l": case "L":
-        if (this.active.view) {
-          this.overlay.toggle("location");
-          this.lastLocationUpdate = 0;
-        }
-        break;
-      case "q": case "Q": {
+    if (!binding?.action) return;
+    switch (binding.action) {
+      case "step": this.select(this.index + (e.key === "ArrowLeft" ? -1 : 1)); break;
+      case "number": this.select(Number(e.key) - 1); break;
+      case "play": e.preventDefault(); this.togglePlay(); break;
+      case "reset": this.resetView(); break;
+      case "palette": this.palette.set(this.palette.index + 1); this.overlay.toast(`配色：${PALETTES[this.palette.index].name}`); break;
+      case "quality": {
         const next = QUALITY_ORDER[(QUALITY_ORDER.indexOf(this.governor.mode) + 1) % QUALITY_ORDER.length];
         this.governor.setMode(next);
         this.overlay.toast(QUALITY_NAMES[next]);
         break;
       }
-      default:
-        if (/^[1-9]$/.test(e.key)) this.select(Number(e.key) - 1);
+      case "fullscreen": e.preventDefault(); toggleFullscreen(); break;
+      case "hideUi": this.overlay.toggleHidden(); break;
+      case "info": this.overlay.toggle("info"); break;
+      case "help": this.overlay.toggle("help"); break;
+      case "debug": this.overlay.toggle("debug"); break;
+      case "progress": this.overlay.cycleProgress(); break;
+      case "location":
+        if (this.active.view) {
+          this.overlay.toggle("location");
+          this.lastLocationUpdate = 0;
+        } else {
+          this.overlay.toast("この現象には座標がありません");
+        }
+        break;
+      case "close": if (!this.overlay.closePanels()) exitFullscreen(); break;
     }
   }
 
@@ -313,7 +324,7 @@ export class App {
     this.overlay.setNotice(active.notice?.());
     this.syncControls();
     if (this.overlay.isOpen("debug")) this.updateDebug(rafMs, cpuMs, width, height);
-    this.updateProgress(now, rafMs, width, height);
+    this.updateProgress(now, rafMs, cpuMs, width, height);
     this.updateLocation(now);
     this.onFrame?.({ now, rafMs, cpuMs });
   }
@@ -365,19 +376,48 @@ export class App {
 
   private lastProgressUpdate = 0;
   private fps = 60;
+  private cpuMs = 0;
 
-  /** Progress line every frame; the detailed panel ~8 times per second. */
-  private updateProgress(now: number, rafMs: number, w: number, h: number): void {
+  /** Progress line every frame; the panel ~8 times per second. */
+  private updateProgress(now: number, rafMs: number, cpuMs: number, w: number, h: number): void {
     this.fps += (1000 / Math.max(rafMs, 1) - this.fps) * 0.05;
+    this.cpuMs += (cpuMs - this.cpuMs) * 0.05;
     const info = this.active.progress?.();
     this.overlay.setProgressLine(info?.fraction);
     if (!info || !this.overlay.isOpen("progress") || now - this.lastProgressUpdate < 120) return;
     this.lastProgressUpdate = now;
-    const gpu = this.timer.enabled && this.timer.frames > 0 ? `${this.timer.frameMs.toFixed(1)} ms` : "計測不可";
-    this.overlay.setProgress(info.headline, [
-      ...info.rows,
-      { label: "GPU 時間 / フレーム", value: `${gpu} · ${this.fps.toFixed(0)} fps · 内部解像度 ${w}×${h}` },
-    ]);
+    this.overlay.setProgress(info.headline, [...info.rows, ...this.renderRows(w, h)]);
+  }
+
+  /** The "描画" group every phenomenon shares: GPU, frame rate, resolution. */
+  private renderRows(w: number, h: number): ProgressRow[] {
+    const group = "描画";
+    const timed = this.timer.enabled && this.timer.frames > 0;
+    const gpu = timed ? `${this.timer.frameMs.toFixed(1)} ms` : "計測不可";
+    const rows: ProgressRow[] = [
+      { group, label: "GPU 時間 / フレーム", value: `${gpu} · ${this.fps.toFixed(0)} fps · 内部解像度 ${w}×${h}` },
+    ];
+    if (timed) {
+      const total = Math.max(this.timer.frameMs, 1e-6);
+      for (const [k, v] of [...this.timer.passMs].sort((a, b) => b[1] - a[1])) {
+        rows.push({ group, detail: true, label: `　${PASS_NAMES[k] ?? k}`, value: `${v.toFixed(2)} ms（${((v / total) * 100).toFixed(0)}%）`, bar: v / total });
+      }
+    }
+    const frameMs = 1000 / Math.max(this.fps, 1e-3);
+    const pixels = w * h;
+    const shown = this.canvas.width * this.canvas.height;
+    rows.push(
+      { group, detail: true, label: "フレーム間隔", value: `${frameMs.toFixed(1)} ms · CPU ${this.cpuMs.toFixed(2)} ms` },
+      { group, detail: true, label: "品質", value: `${QUALITY_NAMES[this.governor.mode].replace("品質：", "")} · 解像度の倍率 ${this.governor.scale}` },
+      {
+        group, detail: true, label: "解像度",
+        value: `内部 ${w}×${h}（${(pixels / 1e6).toFixed(2)} M 画素）→ 表示 ${this.canvas.width}×${this.canvas.height}（${(shown / 1e6).toFixed(2)} M 画素）· DPR ${window.devicePixelRatio || 1}`,
+      },
+    );
+    const a = this.gpu.adapterInfo;
+    const adapter = [a.vendor, a.architecture, a.description].filter(Boolean).join(" ");
+    rows.push({ group, detail: true, label: "GPU", value: `${adapter || "不明"}${this.gpu.hasTimestamps ? "" : "（時間計測なし）"}` });
+    return rows;
   }
 
   private updateDebug(rafMs: number, cpuMs: number, w: number, h: number): void {

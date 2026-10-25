@@ -2,10 +2,10 @@
 // whose roots drift slowly, so the boundaries between basins keep weaving.
 
 import { Camera2D } from "../../core/camera2d";
-import { numberToDecimal } from "../../ui/location";
+import { formatZoom, log2ZoomFromScale, numberToDecimal } from "../../ui/location";
 import type { InputFrame } from "../../core/input";
 import type { FrameContext, Phenomenon, PhenomenonMeta, ProgressInfo } from "../../core/phenomenon";
-import { int } from "../../ui/format";
+import { bigCount, int } from "../../ui/format";
 import { distinctPositions, hexToRgb, type PaletteTexture } from "../../core/palettes";
 import { shaderModule, type GpuContext } from "../../gpu/device";
 import { wgsl } from "../../shaders";
@@ -37,7 +37,7 @@ export class Newton implements Phenomenon {
       '<math><msub><mi>z</mi><mrow><mi>n</mi><mo>+</mo><mn>1</mn></mrow></msub><mo>=</mo><msub><mi>z</mi><mi>n</mi></msub><mo>−</mo><mfrac><mrow><mi>p</mi><mo>(</mo><msub><mi>z</mi><mi>n</mi></msub><mo>)</mo></mrow><mrow><msup><mi>p</mi><mo>′</mo></msup><mo>(</mo><msub><mi>z</mi><mi>n</mi></msub><mo>)</mo></mrow></mfrac><mo>,</mo><mspace width="0.6em"/><mi>p</mi><mo>(</mo><mi>z</mi><mo>)</mo><mo>=</mo><munder><mo>∏</mo><mi>k</mi></munder><mo>(</mo><mi>z</mi><mo>−</mo><msub><mi>r</mi><mi>k</mi></msub><mo>)</mo></math>',
     description:
       "方程式の根を探すニュートン法を、平面のあらゆる点から出発させる。どの根にたどり着くかで塗り分けると、領域の境目には三つ以上の色が無限に入れ子になって接する。根はゆっくりと巡り、境界は絶えず編み直される。",
-    hints: ["ドラッグ — 移動", "ホイール — 拡大・縮小", "N — 根の数を変える", "Space — 動きを止める"],
+    controls: [["N", "根の数を変える（3 → 4 → 5 → 6）"], ["Space", "根の動きを止める ／ 再開する"]],
     motion: "animation",
   };
 
@@ -55,6 +55,8 @@ export class Newton implements Phenomenon {
   private zoomAnchor: [number, number] = [0, 0];
   private velocity: [number, number] = [0, 0];
   private lastKey = "";
+  private viewW = 1;
+  private viewH = 1;
 
   constructor(private palette: () => PaletteTexture) {}
 
@@ -114,6 +116,8 @@ export class Newton implements Phenomenon {
 
   update(input: InputFrame, ctx: { time: number; dt: number; paused: boolean; viewW: number; viewH: number }): void {
     const dt = Math.min(ctx.dt, 0.1);
+    this.viewW = ctx.viewW;
+    this.viewH = ctx.viewH;
     if (this.needsHome) {
       this.camera = new Camera2D(0, 0, Math.log2(4.4 / Math.max(1, Math.min(ctx.viewW, ctx.viewH * 1.5))));
       this.needsHome = false;
@@ -237,11 +241,18 @@ export class Newton implements Phenomenon {
     return {
       headline: f.paused ? "停止中 — 画像は確定しています" : "根が動くため、毎フレーム全画素を描き直しています",
       rows: [
-        { label: "描画方式", value: "1 回の描画で全画素を計算（毎フレーム完了）" },
-        { label: "画素あたりの標本", value: `${f.samples}（回転格子の重ね描き）` },
-        { label: "ニュートン法の反復", value: "最大 64 回 · 根から 10⁻³ 以内で収束とみなす" },
-        { label: "多項式", value: `${PRESETS[this.preset].name}（根 ${PRESETS[this.preset].n} 個）` },
-        { label: "画素数", value: int(f.pixels) },
+        { group: "計算", label: "描画方式", value: "1 回の描画で全画素を計算（毎フレーム完了）" },
+        { group: "計算", label: "画素あたりの標本", value: `${f.samples}（回転格子の重ね描き）` },
+        { group: "計算", label: "ニュートン法の反復", value: "最大 64 回 · 根から 10⁻³ 以内で収束とみなす" },
+        { group: "計算", detail: true, label: "1 フレームの評価回数", value: `最大 ${bigCount(f.pixels * f.samples * 64)} 回（画素 × 標本 × 反復）` },
+        { group: "多項式", label: "多項式", value: `${PRESETS[this.preset].name}（根 ${PRESETS[this.preset].n} 個 · N で切り替え）` },
+        ...this.roots().map(([x, y], i) => ({
+          group: "多項式", detail: true, label: `　根 ${i + 1}`,
+          value: `${x.toFixed(4)} ${y < 0 ? "−" : "+"} ${Math.abs(y).toFixed(4)}i（|z| = ${Math.hypot(x, y).toFixed(4)}）`,
+        })),
+        { group: "位置", detail: true, label: "拡大率", value: formatZoom(log2ZoomFromScale(this.camera.log2Scale, this.viewW, this.viewH)) },
+        { group: "位置", detail: true, label: "中心", value: `${this.camera.cx.toPrecision(8)} ${this.camera.cy < 0 ? "−" : "+"} ${Math.abs(this.camera.cy).toPrecision(8)}i` },
+        { group: "描画", label: "画素数", value: int(f.pixels) },
       ],
     };
   }

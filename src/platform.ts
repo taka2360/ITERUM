@@ -33,6 +33,16 @@ export async function toggleFullscreen(): Promise<void> {
   }
 }
 
+/** Leaves fullscreen if the window is in it. */
+export async function exitFullscreen(): Promise<void> {
+  if (isTauri()) {
+    const w = getCurrentWindow();
+    if (await w.isFullscreen()) await w.setFullscreen(false);
+  } else if (document.fullscreenElement) {
+    await document.exitFullscreen();
+  }
+}
+
 export async function envVar(name: string): Promise<string | undefined> {
   if (!isTauri()) return new URLSearchParams(location.search).get(name.toLowerCase()) ?? undefined;
   return (await invoke<string | null>("env_var", { name })) ?? undefined;
